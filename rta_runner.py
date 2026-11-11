@@ -19,7 +19,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 APP_NAME = "RTA Script Runner"
-APP_VERSION = "1.0"
+APP_VERSION = "1.1"
 IS_WIN = sys.platform.startswith("win")
 
 
@@ -46,6 +46,13 @@ class Job:
     run_now: bool = True        # first run right when started (else after one interval)
     timeout_sec: int = 120      # kill a run that hangs longer than this
     enabled: bool = True
+    kind: str = "script"        # "script" | "teams"
+    target: str = ""            # teams: dashboard LOB / group name
+    link: str = ""              # teams: group-chat link
+    hint: str = ""              # teams: optional text the Teams window title must contain
+
+
+TEAMS_DEFAULTS = {"out_dir": r"C:\RTA\OUT", "idle_sec": 3, "max_age_min": 10, "max_wait_sec": 90}
 
 
 def load_config() -> dict:
@@ -53,13 +60,13 @@ def load_config() -> dict:
         raw = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
         jobs = [Job(**{k: v for k, v in j.items() if k in Job.__dataclass_fields__}) for j in raw.get("jobs", [])]
         return {"jobs": jobs, "autostart": bool(raw.get("autostart", False)),
-                "theme": raw.get("theme", "dark")}
+                "theme": raw.get("theme", "dark"), "teams": {**TEAMS_DEFAULTS, **raw.get("teams", {})}}
     except Exception:
-        return {"jobs": [], "autostart": False, "theme": "dark"}
+        return {"jobs": [], "autostart": False, "theme": "dark", "teams": dict(TEAMS_DEFAULTS)}
 
 
-def save_config(jobs: list[Job], autostart: bool, theme: str) -> None:
-    data = {"version": APP_VERSION, "autostart": autostart, "theme": theme, "jobs": [asdict(j) for j in jobs]}
+def save_config(jobs: list[Job], autostart: bool, theme: str, teams: dict | None = None) -> None:
+    data = {"version": APP_VERSION, "autostart": autostart, "theme": theme, "teams": teams or TEAMS_DEFAULTS, "jobs": [asdict(j) for j in jobs]}
     tmp = CONFIG_FILE.with_suffix(".tmp")
     tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
     tmp.replace(CONFIG_FILE)
@@ -153,6 +160,7 @@ class Scheduler:
         self.log = log_fn
         self.clock = clock
         self.launcher = launcher
+        self.sender = None
         self._stop = threading.Event()
         self.thread = threading.Thread(target=self._loop, daemon=True)
 
@@ -177,6 +185,19 @@ class Scheduler:
                 self.rt.setdefault(j.id, Runtime())
 
     def validate(self, j: Job) -> str | None:
+        if j.kind == "teams":
+            from teams_sender import valid_chat_link
+            if not j.target:
+                return "Pick the dashboard LOB / group to send"
+            if not valid_chat_link(j.link):
+                return "Paste the group chat link (Teams → chat → ⋯ → Copy link)"
+            try:
+                if float(j.every_min) <= 0:
+                    return "'Every' must be more than 0 minutes"
+                parse_hhmm(j.start_at); parse_hhmm(j.stop_at)
+            except ValueError as e:
+                return str(e)
+            return None
         if not j.path:
             return "Choose a script file"
         if not Path(j.path).exists():
@@ -240,10 +261,21 @@ class Scheduler:
     def label(j: Job | None) -> str:
         if not j:
             return "?"
+        if j.kind == "teams":
+            return f"Teams · {j.target or j.name or 'chat'}"
         return j.name or Path(j.path).name or "job"
 
     # -- core loop
     def _fire(self, j: Job, r: Runtime, manual=False):
+        if j.kind == "teams":
+            if not self.sender:
+                r.last_result = "Error: sender not available"; return
+            def done(res, r=r):
+                with self.lock:
+                    r.last_result = res
+            r.last_result = self.sender.enqueue(j.id, j.target, j.link, j.hint, done)
+            r.last_run = self.clock(); r.runs += 1
+            return
         if r.proc and r.proc.poll() is None:
             if time.time() - r.proc_started > j.timeout_sec:
                 try:
@@ -317,10 +349,12 @@ class Scheduler:
 def run_app():
     import customtkinter as ctk
     from tkinter import filedialog, messagebox
+    import teams_sender as TS
 
     cfg = load_config()
     ctk.set_appearance_mode(cfg["theme"])
     ctk.set_default_color_theme("blue")
+    teams_cfg = cfg["teams"]
 
     log_q: "queue.Queue[str]" = queue.Queue()
 
@@ -333,57 +367,72 @@ def run_app():
         except Exception:
             pass
 
+    def teams_settings():
+        return {"out_dir": teams_cfg.get("out_dir", ""), "idle_sec": float(teams_cfg.get("idle_sec", 3)),
+                "max_age_min": float(teams_cfg.get("max_age_min", 10)), "max_wait_sec": float(teams_cfg.get("max_wait_sec", 90))}
+
     sched = Scheduler(log)
-    jobs: list[Job] = cfg["jobs"] or [Job(name="", every_min=2.0)]
+    sender = TS.TeamsSender(log, teams_settings)
+    sched.sender = sender
+    jobs: list[Job] = cfg["jobs"] or [Job(every_min=2.0)]
     sched.set_jobs(jobs)
     sched.begin()
+    sender.begin()
 
     GOOD, WARN, BAD, MUTED = "#34c26f", "#f0b429", "#f0605d", "#8a90a0"
     STATE_COLOR = {"Running": GOOD, "Waiting": GOOD, "Stopped": MUTED, "Finished": WARN, "Error": BAD}
+    TARGETS = ["EG TSX 4P", "EG XM BO", "EG Hotline", "EG Fraud", "BSC", "BSD", "CSA (all)", "SMB Voice", "SMB Chat", "MM Care",
+               "CSA T1", "CSA T2", "CSA Spanish"]
 
     root = ctk.CTk()
-    root.title(f"{APP_NAME}")
-    root.geometry("1340x740")
-    root.minsize(980, 560)
-
-    # ---------- header
-    head = ctk.CTkFrame(root, corner_radius=0, fg_color=("gray92", "#15181e"))
-    head.pack(fill="x")
-    ctk.CTkLabel(head, text="RTA Script Runner", font=ctk.CTkFont(size=18, weight="bold")).pack(side="left", padx=(18, 6), pady=12)
-    ctk.CTkLabel(head, text="runs your CMS export scripts on a timer", text_color=MUTED).pack(side="left", pady=12)
-    clock_lbl = ctk.CTkLabel(head, text="", font=ctk.CTkFont(size=14, weight="bold"))
-    clock_lbl.pack(side="right", padx=18)
-
-    bar = ctk.CTkFrame(root, fg_color="transparent")
-    bar.pack(fill="x", padx=16, pady=(12, 6))
+    root.title(f"{APP_NAME} {APP_VERSION}")
+    root.geometry("1380x780")
+    root.minsize(1100, 600)
 
     autostart_var = ctk.BooleanVar(value=cfg["autostart"])
     theme_var = ctk.StringVar(value=cfg["theme"])
 
     def persist():
         try:
-            save_config(jobs, autostart_var.get(), theme_var.get())
+            save_config(jobs, autostart_var.get(), theme_var.get(), teams_cfg)
         except Exception as e:  # noqa: BLE001
             log(f"could not save settings: {e}")
 
-    # ---------- job list
-    cols = ctk.CTkFrame(root, fg_color="transparent")
-    cols.pack(fill="x", padx=22)
-    header_cols = [("", 34), ("Name", 130), ("Script file", 270), ("Every (min)", 80), ("Start at", 78),
-                   ("Stop at", 78), ("Status", 110), ("Next run", 110), ("Last run · result", 160), ("", 160)]
-    for i, (t, w) in enumerate(header_cols):
-        ctk.CTkLabel(cols, text=t, width=w, anchor="w", text_color=MUTED, font=ctk.CTkFont(size=12)).grid(row=0, column=i, padx=3, sticky="w")
+    # ---------- header
+    head = ctk.CTkFrame(root, corner_radius=0, fg_color=("gray92", "#15181e"))
+    head.pack(fill="x")
+    ctk.CTkLabel(head, text="RTA Script Runner", font=ctk.CTkFont(size=18, weight="bold")).pack(side="left", padx=(18, 6), pady=12)
+    ctk.CTkLabel(head, text="CMS exports + Teams sending on a timer", text_color=MUTED).pack(side="left", pady=12)
+    clock_lbl = ctk.CTkLabel(head, text="", font=ctk.CTkFont(size=14, weight="bold"))
+    clock_lbl.pack(side="right", padx=18)
+    pause_btn = ctk.CTkButton(head, text="Pause Teams sending  (Ctrl+Alt+P)", width=230, fg_color=("gray75", "#3a4150"))
+    pause_btn.pack(side="right", padx=8)
 
-    listf = ctk.CTkScrollableFrame(root, fg_color=("gray95", "#1c2028"), corner_radius=12)
-    listf.pack(fill="both", expand=True, padx=16, pady=(2, 8))
+    def toggle_pause():
+        sender.paused = not sender.paused
+        log("Teams sending PAUSED" if sender.paused else "Teams sending resumed")
+    pause_btn.configure(command=toggle_pause)
+
+    tabs = ctk.CTkTabview(root, corner_radius=12)
+    tabs.pack(fill="both", expand=True, padx=12, pady=(6, 4))
+    tab_s = tabs.add("CMS scripts")
+    tab_t = tabs.add("Teams sending")
 
     rows: dict[str, dict] = {}
 
+    def job(jid):
+        return next(x for x in jobs if x.id == jid)
+
+    # ---------- generic row helpers
     def apply_row(jid):
-        """Copy widget values into the Job object."""
-        w, j = rows[jid], next(x for x in jobs if x.id == jid)
-        j.name = w["name"].get().strip()
-        j.path = w["path"].get().strip().strip('"')
+        w, j = rows[jid], job(jid)
+        j.name = w["name"].get().strip() if "name" in w else j.name
+        if j.kind == "script":
+            j.path = w["path"].get().strip().strip('"')
+        else:
+            j.target = w["target"].get().strip()
+            j.link = w["link"].get().strip()
+            j.hint = w["hint"].get().strip()
         try:
             j.every_min = float(w["every"].get().strip() or 0)
         except ValueError:
@@ -394,175 +443,259 @@ def run_app():
         return j
 
     def on_edit(jid):
-        apply_row(jid)
-        persist()
+        apply_row(jid); persist()
+
+    def toggle(jid):
+        j = apply_row(jid); persist()
+        if sched.rt[jid].active:
+            sched.stop(jid)
+        else:
+            err = sched.start(jid)
+            if err:
+                messagebox.showwarning(APP_NAME, f"{Scheduler.label(j)}: {err}")
+
+    def run_once(jid):
+        j = apply_row(jid)
+        err = sched.validate(j)
+        if err and "Every" not in err:
+            messagebox.showwarning(APP_NAME, err); return
+        sched.run_now(jid)
+
+    def remove(jid):
+        j = job(jid)
+        if sched.rt[jid].active and not messagebox.askyesno(APP_NAME, f"'{Scheduler.label(j)}' is running. Stop and remove it?"):
+            return
+        jobs.remove(j)
+        rows.pop(jid)["frame"].destroy()
+        sched.set_jobs(jobs); persist()
+
+    def common_tail(f, w, j, c):
+        w["every"] = ctk.CTkEntry(f, width=70, justify="center"); w["every"].insert(0, f"{j.every_min:g}"); w["every"].grid(row=0, column=c, padx=3); c += 1
+        w["start"] = ctk.CTkEntry(f, width=70, justify="center", placeholder_text="now"); w["start"].insert(0, j.start_at); w["start"].grid(row=0, column=c, padx=3); c += 1
+        w["stop"] = ctk.CTkEntry(f, width=70, justify="center", placeholder_text="never"); w["stop"].insert(0, j.stop_at); w["stop"].grid(row=0, column=c, padx=3); c += 1
+        w["state"] = ctk.CTkLabel(f, text="Stopped", width=105, anchor="w", text_color=MUTED, font=ctk.CTkFont(weight="bold")); w["state"].grid(row=0, column=c, padx=3); c += 1
+        w["next"] = ctk.CTkLabel(f, text="—", width=100, anchor="w"); w["next"].grid(row=0, column=c, padx=3); c += 1
+        w["last"] = ctk.CTkLabel(f, text="—", width=210 if j.kind == "teams" else 160, anchor="w", text_color=MUTED, wraplength=210 if j.kind == "teams" else 160, justify="left"); w["last"].grid(row=0, column=c, padx=3); c += 1
+        bf = ctk.CTkFrame(f, fg_color="transparent"); bf.grid(row=0, column=c, padx=(3, 8))
+        w["btn"] = ctk.CTkButton(bf, text="Start", width=62, fg_color="#1f8a4c", hover_color="#187040", command=lambda: toggle(j.id)); w["btn"].pack(side="left")
+        ctk.CTkButton(bf, text="Send" if j.kind == "teams" else "Run", width=46, fg_color=("gray75", "#3a4150"), command=lambda: run_once(j.id)).pack(side="left", padx=3)
+        ctk.CTkButton(bf, text="✕", width=28, fg_color="transparent", hover_color=("gray80", "#3a2a2a"), text_color=BAD, command=lambda: remove(j.id)).pack(side="left")
+        for k in ("name", "path", "link", "hint", "every", "start", "stop"):
+            if k in w:
+                w[k].bind("<FocusOut>", lambda e, jid=j.id: on_edit(jid))
+                w[k].bind("<Return>", lambda e, jid=j.id: on_edit(jid))
+
+    # ---------- CMS scripts tab
+    sbar = ctk.CTkFrame(tab_s, fg_color="transparent"); sbar.pack(fill="x", pady=(2, 6))
+    shead = ctk.CTkFrame(tab_s, fg_color="transparent"); shead.pack(fill="x", padx=6)
+    for i, (t, wd) in enumerate([("", 34), ("Name", 120), ("Script file", 270), ("Every", 70), ("Start", 70), ("Stop", 70),
+                                 ("Status", 105), ("Next run", 100), ("Last run · result", 160), ("", 150)]):
+        ctk.CTkLabel(shead, text=t, width=wd, anchor="w", text_color=MUTED, font=ctk.CTkFont(size=12)).grid(row=0, column=i, padx=3, sticky="w")
+    slist = ctk.CTkScrollableFrame(tab_s, fg_color=("gray95", "#1c2028"), corner_radius=12)
+    slist.pack(fill="both", expand=True)
 
     def browse(jid):
         p = filedialog.askopenfilename(title="Choose CMS export script",
                                        filetypes=[("CMS scripts", "*.acsauto"), ("Scripts", "*.acsauto *.bat *.cmd *.ps1 *.vbs *.exe *.py"), ("All files", "*.*")])
         if p:
             w = rows[jid]
-            w["path"].delete(0, "end")
-            w["path"].insert(0, os.path.normpath(p))
+            w["path"].delete(0, "end"); w["path"].insert(0, os.path.normpath(p))
             if not w["name"].get().strip():
                 w["name"].insert(0, Path(p).stem)
             on_edit(jid)
 
-    def toggle(jid):
-        j = apply_row(jid)
-        persist()
-        if sched.rt[jid].active:
-            sched.stop(jid)
-        else:
-            err = sched.start(jid)
-            if err:
-                messagebox.showwarning(APP_NAME, f"{Sched_label(j)}: {err}")
-
-    def Sched_label(j):  # noqa: N802
-        return Scheduler.label(j)
-
-    def run_once(jid):
-        j = apply_row(jid)
-        err = sched.validate(j)
-        if err and "Every" not in err:
-            messagebox.showwarning(APP_NAME, err)
-            return
-        sched.run_now(jid)
-
-    def remove(jid):
-        j = next(x for x in jobs if x.id == jid)
-        if sched.rt[jid].active and not messagebox.askyesno(APP_NAME, f"'{Sched_label(j)}' is running. Stop and remove it?"):
-            return
-        jobs.remove(j)
-        rows.pop(jid)["frame"].destroy()
-        sched.set_jobs(jobs)
-        persist()
-
-    def add_row(j: Job):
-        f = ctk.CTkFrame(listf, fg_color=("white", "#242935"), corner_radius=10)
-        f.pack(fill="x", pady=4, padx=4)
-        en = ctk.BooleanVar(value=j.enabled)
-        w = {"frame": f, "en": en}
-        c = 0
+    def add_script_row(j: Job):
+        f = ctk.CTkFrame(slist, fg_color=("white", "#242935"), corner_radius=10); f.pack(fill="x", pady=4, padx=4)
+        en = ctk.BooleanVar(value=j.enabled); w = {"frame": f, "en": en}; c = 0
         ctk.CTkCheckBox(f, text="", variable=en, width=28, command=lambda: on_edit(j.id)).grid(row=0, column=c, padx=(8, 2), pady=8); c += 1
-        w["name"] = ctk.CTkEntry(f, width=130, placeholder_text="e.g. TSX"); w["name"].insert(0, j.name); w["name"].grid(row=0, column=c, padx=3); c += 1
+        w["name"] = ctk.CTkEntry(f, width=120, placeholder_text="e.g. TSX"); w["name"].insert(0, j.name); w["name"].grid(row=0, column=c, padx=3); c += 1
         pf = ctk.CTkFrame(f, fg_color="transparent"); pf.grid(row=0, column=c, padx=3); c += 1
         w["path"] = ctk.CTkEntry(pf, width=228, placeholder_text="C:\\RTA\\Scripts\\TSX.acsauto"); w["path"].insert(0, j.path); w["path"].pack(side="left")
         ctk.CTkButton(pf, text="…", width=34, command=lambda: browse(j.id)).pack(side="left", padx=(4, 0))
-        w["every"] = ctk.CTkEntry(f, width=80, justify="center"); w["every"].insert(0, f"{j.every_min:g}"); w["every"].grid(row=0, column=c, padx=3); c += 1
-        w["start"] = ctk.CTkEntry(f, width=78, justify="center", placeholder_text="now"); w["start"].insert(0, j.start_at); w["start"].grid(row=0, column=c, padx=3); c += 1
-        w["stop"] = ctk.CTkEntry(f, width=78, justify="center", placeholder_text="never"); w["stop"].insert(0, j.stop_at); w["stop"].grid(row=0, column=c, padx=3); c += 1
-        w["state"] = ctk.CTkLabel(f, text="Stopped", width=110, anchor="w", text_color=MUTED, font=ctk.CTkFont(weight="bold")); w["state"].grid(row=0, column=c, padx=3); c += 1
-        w["next"] = ctk.CTkLabel(f, text="—", width=110, anchor="w"); w["next"].grid(row=0, column=c, padx=3); c += 1
-        w["last"] = ctk.CTkLabel(f, text="—", width=160, anchor="w", text_color=MUTED); w["last"].grid(row=0, column=c, padx=3); c += 1
-        bf = ctk.CTkFrame(f, fg_color="transparent"); bf.grid(row=0, column=c, padx=(3, 8))
-        w["btn"] = ctk.CTkButton(bf, text="▶ Start", width=74, fg_color="#1f8a4c", hover_color="#187040", command=lambda: toggle(j.id)); w["btn"].pack(side="left")
-        ctk.CTkButton(bf, text="Run", width=40, fg_color=("gray75", "#3a4150"), command=lambda: run_once(j.id)).pack(side="left", padx=3)
-        ctk.CTkButton(bf, text="✕", width=28, fg_color="transparent", hover_color=("gray80", "#3a2a2a"), text_color=BAD, command=lambda: remove(j.id)).pack(side="left")
-        for k in ("name", "path", "every", "start", "stop"):
-            w[k].bind("<FocusOut>", lambda e, jid=j.id: on_edit(jid))
-            w[k].bind("<Return>", lambda e, jid=j.id: on_edit(jid))
         rows[j.id] = w
+        common_tail(f, w, j, c)
 
-    def new_job():
-        j = Job(every_min=2.0)
-        jobs.append(j)
-        sched.set_jobs(jobs)
-        add_row(j)
+    # ---------- Teams tab
+    tset = ctk.CTkFrame(tab_t, fg_color=("gray93", "#1c2028"), corner_radius=10); tset.pack(fill="x", pady=(2, 6))
+    def labeled(parent, text, width, value, ph=""):
+        ctk.CTkLabel(parent, text=text, text_color=MUTED).pack(side="left", padx=(10, 4), pady=8)
+        e = ctk.CTkEntry(parent, width=width, placeholder_text=ph); e.insert(0, str(value)); e.pack(side="left"); return e
+    out_e = labeled(tset, "Dashboard export folder", 220, teams_cfg.get("out_dir", ""), r"C:\RTA\OUT")
+    def pick_out():
+        d = filedialog.askdirectory(title="Dashboard picture export folder")
+        if d:
+            out_e.delete(0, "end"); out_e.insert(0, os.path.normpath(d)); save_tset()
+    ctk.CTkButton(tset, text="…", width=34, command=pick_out).pack(side="left", padx=4)
+    idle_e = labeled(tset, "Wait until idle (s)", 50, teams_cfg.get("idle_sec", 3))
+    age_e = labeled(tset, "Skip if data older than (min)", 50, teams_cfg.get("max_age_min", 10))
+    wait_e = labeled(tset, "Give up waiting after (s)", 50, teams_cfg.get("max_wait_sec", 90))
+
+    def save_tset(*_):
+        teams_cfg["out_dir"] = out_e.get().strip()
+        for k, e, dflt in (("idle_sec", idle_e, 3), ("max_age_min", age_e, 10), ("max_wait_sec", wait_e, 90)):
+            try:
+                teams_cfg[k] = float(e.get())
+            except ValueError:
+                teams_cfg[k] = dflt
+        persist()
+    for e in (out_e, idle_e, age_e, wait_e):
+        e.bind("<FocusOut>", save_tset); e.bind("<Return>", save_tset)
+
+    tbar = ctk.CTkFrame(tab_t, fg_color="transparent"); tbar.pack(fill="x", pady=(0, 6))
+    thead = ctk.CTkFrame(tab_t, fg_color="transparent"); thead.pack(fill="x", padx=6)
+    for i, (t, wd) in enumerate([("", 34), ("Dashboard LOB", 130), ("Group chat link", 200), ("Title contains", 110), ("Every", 70), ("Start", 70),
+                                 ("Stop", 70), ("Status", 105), ("Next send", 100), ("Last send · result", 210), ("", 150)]):
+        ctk.CTkLabel(thead, text=t, width=wd, anchor="w", text_color=MUTED, font=ctk.CTkFont(size=12)).grid(row=0, column=i, padx=3, sticky="w")
+    tlist = ctk.CTkScrollableFrame(tab_t, fg_color=("gray95", "#1c2028"), corner_radius=12)
+    tlist.pack(fill="both", expand=True)
+
+    def add_teams_row(j: Job):
+        f = ctk.CTkFrame(tlist, fg_color=("white", "#242935"), corner_radius=10); f.pack(fill="x", pady=4, padx=4)
+        en = ctk.BooleanVar(value=j.enabled); w = {"frame": f, "en": en}; c = 0
+        ctk.CTkCheckBox(f, text="", variable=en, width=28, command=lambda: on_edit(j.id)).grid(row=0, column=c, padx=(8, 2), pady=8); c += 1
+        w["target"] = ctk.CTkComboBox(f, width=130, values=TARGETS, command=lambda _v: on_edit(j.id)); w["target"].set(j.target or ""); w["target"].grid(row=0, column=c, padx=3); c += 1
+        w["link"] = ctk.CTkEntry(f, width=200, placeholder_text="https://teams…/l/chat/…"); w["link"].insert(0, j.link); w["link"].grid(row=0, column=c, padx=3); c += 1
+        w["hint"] = ctk.CTkEntry(f, width=110, placeholder_text="optional"); w["hint"].insert(0, j.hint); w["hint"].grid(row=0, column=c, padx=3); c += 1
+        rows[j.id] = w
+        common_tail(f, w, j, c)
+
+    def new_job(kind):
+        j = Job(every_min=2.0 if kind == "script" else 3.0, kind=kind)
+        jobs.append(j); sched.set_jobs(jobs)
+        (add_script_row if kind == "script" else add_teams_row)(j)
         persist()
 
-    for j in jobs:
-        add_row(j)
+    def paste_chats():
+        dlg = ctk.CTkToplevel(root); dlg.title("Paste chat list"); dlg.geometry("720x420"); dlg.grab_set()
+        ctk.CTkLabel(dlg, text="One per line:   TSX: https://teams.cloud.microsoft/l/chat/…   (labels like TSX, XMBO, CSA, SMB Voice are mapped to dashboard LOBs)",
+                     wraplength=680, justify="left").pack(padx=12, pady=(12, 6), anchor="w")
+        box = ctk.CTkTextbox(dlg, height=280); box.pack(fill="both", expand=True, padx=12)
+        def go():
+            items = TS.parse_chat_list(box.get("1.0", "end"))
+            have = {(x.target, x.link) for x in jobs if x.kind == "teams"}
+            n = 0
+            for label, link in items:
+                tgt = TS.target_for(label)
+                if (tgt, link) in have:
+                    continue
+                j = Job(kind="teams", target=tgt, link=link, every_min=3.0, name=label)
+                jobs.append(j); add_teams_row(j); n += 1
+            sched.set_jobs(jobs); persist(); log(f"added {n} Teams chat(s)"); dlg.destroy()
+        ctk.CTkButton(dlg, text="Add chats", command=go).pack(pady=10)
 
-    # ---------- toolbar
-    def start_all():
+    for j in jobs:
+        (add_teams_row if j.kind == "teams" else add_script_row)(j)
+
+    # ---------- toolbars
+    def start_kind(kind):
         for jid in rows:
             apply_row(jid)
         persist()
-        sched.start_all()
+        for j in jobs:
+            if j.kind == kind and j.enabled and not sched.rt[j.id].active:
+                sched.start(j.id)
 
-    def stop_all():
-        sched.stop_all()
+    def stop_kind(kind):
+        for j in jobs:
+            if j.kind == kind:
+                sched.stop(j.id)
 
-    def set_all_stop():
-        t = stop_all_entry.get().strip()
+    def set_stop(kind, entry):
+        t = entry.get().strip()
         try:
             parse_hhmm(t)
         except ValueError as e:
             messagebox.showwarning(APP_NAME, str(e)); return
         for jid, w in rows.items():
-            w["stop"].delete(0, "end"); w["stop"].insert(0, t); apply_row(jid)
-        persist()
-        log(f"stop time {t or '(none)'} applied to all jobs — restart running jobs to use it")
+            if job(jid).kind == kind:
+                w["stop"].delete(0, "end"); w["stop"].insert(0, t); apply_row(jid)
+        persist(); log(f"stop time {t or '(none)'} applied — restart running rows to use it")
 
-    ctk.CTkButton(bar, text="＋ Add script", width=120, command=new_job).pack(side="left")
-    ctk.CTkButton(bar, text="▶ Start all", width=110, fg_color="#1f8a4c", hover_color="#187040", command=start_all).pack(side="left", padx=8)
-    ctk.CTkButton(bar, text="■ Stop all", width=110, fg_color="#b23b3b", hover_color="#8f2f2f", command=stop_all).pack(side="left")
-    ctk.CTkLabel(bar, text="   Stop all at", text_color=MUTED).pack(side="left")
-    stop_all_entry = ctk.CTkEntry(bar, width=80, justify="center", placeholder_text="23:00")
-    stop_all_entry.pack(side="left", padx=6)
-    ctk.CTkButton(bar, text="Apply", width=60, fg_color=("gray75", "#3a4150"), command=set_all_stop).pack(side="left")
+    for bar_, kind, addtxt in ((sbar, "script", "+ Add script"), (tbar, "teams", "+ Add chat")):
+        ctk.CTkButton(bar_, text=addtxt, width=110, command=lambda k=kind: new_job(k)).pack(side="left")
+        if kind == "teams":
+            ctk.CTkButton(bar_, text="Paste chat list", width=120, fg_color=("gray75", "#3a4150"), command=paste_chats).pack(side="left", padx=(8, 0))
+        ctk.CTkButton(bar_, text="Start all", width=96, fg_color="#1f8a4c", hover_color="#187040", command=lambda k=kind: start_kind(k)).pack(side="left", padx=8)
+        ctk.CTkButton(bar_, text="Stop all", width=96, fg_color="#b23b3b", hover_color="#8f2f2f", command=lambda k=kind: stop_kind(k)).pack(side="left")
+        ctk.CTkLabel(bar_, text="   Stop all at", text_color=MUTED).pack(side="left")
+        se = ctk.CTkEntry(bar_, width=76, justify="center", placeholder_text="23:00"); se.pack(side="left", padx=6)
+        ctk.CTkButton(bar_, text="Apply", width=60, fg_color=("gray75", "#3a4150"), command=lambda k=kind, e=se: set_stop(k, e)).pack(side="left")
 
     def toggle_theme():
         theme_var.set("light" if theme_var.get() == "dark" else "dark")
         ctk.set_appearance_mode(theme_var.get()); persist()
-
-    ctk.CTkButton(bar, text="◐", width=34, fg_color=("gray75", "#3a4150"), command=toggle_theme).pack(side="right")
-    ctk.CTkCheckBox(bar, text="Start all jobs when the app opens", variable=autostart_var, command=persist).pack(side="right", padx=12)
+    ctk.CTkButton(sbar, text="◐", width=34, fg_color=("gray75", "#3a4150"), command=toggle_theme).pack(side="right")
+    ctk.CTkCheckBox(sbar, text="Start all rows (both tabs) when the app opens", variable=autostart_var, command=persist).pack(side="right", padx=12)
+    ctk.CTkLabel(tbar, text="Sends view + flags pictures in one message. Keep Teams signed in. Test with 'Send' first.",
+                 text_color=MUTED).pack(side="right", padx=8)
 
     # ---------- log
-    logf = ctk.CTkFrame(root, fg_color="transparent")
-    logf.pack(fill="x", padx=16, pady=(0, 6))
+    logf = ctk.CTkFrame(root, fg_color="transparent"); logf.pack(fill="x", padx=16, pady=(0, 4))
     ctk.CTkLabel(logf, text="Log", text_color=MUTED).pack(side="left")
     ctk.CTkButton(logf, text="Open log file", width=100, fg_color=("gray75", "#3a4150"),
                   command=lambda: os.startfile(LOG_FILE) if IS_WIN else None).pack(side="right")
-    logbox = ctk.CTkTextbox(root, height=150, font=ctk.CTkFont(family="Consolas", size=12))
-    logbox.pack(fill="x", padx=16, pady=(0, 10))
-    logbox.configure(state="disabled")
+    logbox = ctk.CTkTextbox(root, height=140, font=ctk.CTkFont(family="Consolas", size=12))
+    logbox.pack(fill="x", padx=16, pady=(0, 8)); logbox.configure(state="disabled")
+    ctk.CTkLabel(root, text="Times = this PC's clock (Cairo). Every = minutes (0.5 = 30 s). Start/Stop = 23:00 or 11:00 PM; earlier than now = tomorrow.",
+                 text_color=MUTED, font=ctk.CTkFont(size=11)).pack(fill="x", padx=18, pady=(0, 6))
 
-    foot = ctk.CTkLabel(root, text="Times are this PC's clock (Cairo). Every = minutes, decimals allowed (0.5 = 30 s). "
-                                   "Start/Stop at = 24h HH:MM or 11:00 PM; a stop time earlier than now means tomorrow.",
-                        text_color=MUTED, font=ctk.CTkFont(size=11))
-    foot.pack(fill="x", padx=18, pady=(0, 8))
+    # ---------- global pause hotkey (Ctrl+Alt+P)
+    if IS_WIN:
+        def hotkey_thread():
+            import ctypes
+            from ctypes import wintypes
+            u = ctypes.windll.user32
+            if not u.RegisterHotKey(None, 1, 0x0002 | 0x0001 | 0x4000, 0x50):   # CTRL|ALT|NOREPEAT, 'P'
+                log("note: Ctrl+Alt+P hotkey unavailable (used by another app) — use the Pause button")
+                return
+            msg = wintypes.MSG()
+            while u.GetMessageW(ctypes.byref(msg), None, 0, 0) != 0:
+                if msg.message == 0x0312:
+                    root.after(0, toggle_pause)
+        threading.Thread(target=hotkey_thread, daemon=True).start()
 
     # ---------- refresh UI
     def refresh():
         while not log_q.empty():
             line = log_q.get_nowait()
             logbox.configure(state="normal"); logbox.insert("end", line + "\n")
-            if int(logbox.index("end-1c").split(".")[0]) > 600:
-                logbox.delete("1.0", "100.0")
+            if int(logbox.index("end-1c").split(".")[0]) > 800:
+                logbox.delete("1.0", "200.0")
             logbox.see("end"); logbox.configure(state="disabled")
         snap = sched.snapshot()
         for jid, w in rows.items():
             if jid not in snap:
                 continue
             state, nxt, last, res, runs, stop_dt, active = snap[jid]
-            label = state + (f" · {runs} run{'s' if runs!=1 else ''}" if runs and state in ("Running", "Waiting") else "")
+            label = state + (f" · {runs}" if runs and state in ("Running", "Waiting") else "")
             w["state"].configure(text=label, text_color=STATE_COLOR.get(state, MUTED))
             w["next"].configure(text=fmt_dt(nxt) if active else "—")
-            w["last"].configure(text=(fmt_dt(last) + " · " + res) if last else res, text_color=BAD if res.startswith(("Error", "Exit")) else MUTED)
+            bad = res.startswith(("Error", "Exit"))
+            good = res.startswith("Sent")
+            w["last"].configure(text=(fmt_dt(last) + " · " + res) if last else res,
+                                text_color=BAD if bad else GOOD if good else WARN if res.startswith("Skipped") else MUTED)
             if active:
-                w["btn"].configure(text="■ Stop", fg_color="#b23b3b", hover_color="#8f2f2f")
+                w["btn"].configure(text="Stop", fg_color="#b23b3b", hover_color="#8f2f2f")
             else:
-                w["btn"].configure(text="▶ Start", fg_color="#1f8a4c", hover_color="#187040")
-        clock_lbl.configure(text=datetime.now().strftime("%I:%M:%S %p").lstrip("0"))
+                w["btn"].configure(text="Start", fg_color="#1f8a4c", hover_color="#187040")
+        pause_btn.configure(text=("RESUME Teams sending" if sender.paused else "Pause Teams sending  (Ctrl+Alt+P)"),
+                            fg_color=("#e0a000" if sender.paused else ("gray75", "#3a4150")))
+        clock_lbl.configure(text=datetime.now().strftime("%I:%M:%S %p").lstrip("0") + ("  · sending…" if sender.busy else ""))
         root.after(500, refresh)
 
     def on_close():
-        active = [jid for jid, s in sched.snapshot().items() if s[6]]
-        if active and not messagebox.askyesno(APP_NAME, f"{len(active)} job(s) are running. Closing stops them. Close anyway?"):
+        active = [jid for jid, s_ in sched.snapshot().items() if s_[6]]
+        if active and not messagebox.askyesno(APP_NAME, f"{len(active)} row(s) are running. Closing stops them. Close anyway?"):
             return
         for jid in rows:
             apply_row(jid)
-        persist()
-        sched.shutdown()
-        root.destroy()
+        save_tset(); persist()
+        sched.shutdown(); sender.shutdown(); root.destroy()
 
     root.protocol("WM_DELETE_WINDOW", on_close)
     log(f"{APP_NAME} {APP_VERSION} ready · settings: {CONFIG_FILE}")
     if autostart_var.get():
-        root.after(800, start_all)
+        root.after(800, lambda: (start_kind("script"), start_kind("teams")))
     refresh()
     root.mainloop()
 

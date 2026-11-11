@@ -1,5 +1,7 @@
 # RTA Script Runner
 
+Two tabs: **CMS scripts** (run CMS export scripts on a timer) and **Teams sending** (post the dashboard pictures to Teams group chats).
+
 Runs your CMS export scripts (`.acsauto`, also `.bat`, `.ps1`, `.vbs`, `.exe`) on a timer.
 
 ## Use it
@@ -24,3 +26,11 @@ Double-click `build_exe.bat` → the app appears in `dist\RTA_Script_Runner.exe`
 Or with GitHub: push this folder to a repo → Actions → "Build RTA Script Runner" → download the `RTA_Script_Runner` artifact.
 
 If Windows SmartScreen warns ("unrecognized app"): More info → Run anyway. If IT policy blocks unsigned .exe files, ask IT to allow it.
+
+## Teams sending (v1.1)
+1. In the dashboard: Data & Setup → **Picture export folder** → Connect `C:\RTA\OUT`. It writes `<LOB>_view.png`, `<LOB>_flags.png` and `manifest.json` every minute.
+2. In the app: **Teams sending** tab → set the same folder → **Paste chat list** (`TSX: https://teams…/l/chat/…`, one per line).
+3. Press **Send** on one row to test, then **Start all**.
+
+Each send: waits until you stop typing for 3 s → checks the pictures and CMS data are fresh (default ≤ 10 min, else skipped) → opens the chat in the Teams desktop app → checks Teams is the front window → Alt+Shift+C (compose box) → clears any draft → pastes view + flags → Enter → returns you to your window and restores your copied text.
+Pause/resume any time: **Ctrl+Alt+P** or the Pause button. Optional "Title contains" = part of the chat name, as an extra check before pasting.
