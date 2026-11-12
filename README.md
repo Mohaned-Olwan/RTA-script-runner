@@ -34,3 +34,8 @@ If Windows SmartScreen warns ("unrecognized app"): More info → Run anyway. If 
 
 Each send: waits until you stop typing for 3 s → checks the pictures and CMS data are fresh (default ≤ 10 min, else skipped) → opens the chat in the Teams desktop app → checks Teams is the front window → Alt+Shift+C (compose box) → clears any draft → pastes view + flags → Enter → returns you to your window and restores your copied text.
 Pause/resume any time: **Ctrl+Alt+P** or the Pause button. Optional "Title contains" = part of the chat name, as an extra check before pasting.
+
+## Reports tab (v1.2)
+- **LAT export**: Voice (Detailed Dashboard) and/or Chat → CSV. Pick any date (default = today EST) and the save folder. Files: `LAT_Export_Voice.csv`, `LAT_Export_Chat.csv` (other dates get a date suffix).
+- **IEX Agent Schedules** (EG_MU · 1000 COMCAST_EG): pick From/To dates (default today EST) and the save folder. File: `EG_MU_Agent_Schedules`.
+- **Open folder** opens the save folder. Logins are stored in Windows Credential Manager. Runs headless in the installed Microsoft Edge.

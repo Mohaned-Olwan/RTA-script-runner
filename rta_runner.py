@@ -19,7 +19,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 APP_NAME = "RTA Script Runner"
-APP_VERSION = "1.1"
+APP_VERSION = "1.2"
 IS_WIN = sys.platform.startswith("win")
 
 
@@ -417,6 +417,7 @@ def run_app():
     tabs.pack(fill="both", expand=True, padx=12, pady=(6, 4))
     tab_s = tabs.add("CMS scripts")
     tab_t = tabs.add("Teams sending")
+    tab_r = tabs.add("Reports")
 
     rows: dict[str, dict] = {}
 
@@ -628,6 +629,119 @@ def run_app():
     ctk.CTkCheckBox(sbar, text="Start all rows (both tabs) when the app opens", variable=autostart_var, command=persist).pack(side="right", padx=12)
     ctk.CTkLabel(tbar, text="Sends view + flags pictures in one message. Keep Teams signed in. Test with 'Send' first.",
                  text_color=MUTED).pack(side="right", padx=8)
+
+    # ---------- Reports tab (LAT + IEX exporters)
+    import reports as RP
+    RFONT = ctk.CTkFont(size=15, weight="bold")
+
+    def rcard(parent, title, sub):
+        f = ctk.CTkFrame(parent, fg_color=("white", "#242935"), corner_radius=12)
+        f.pack(fill="x", padx=6, pady=6)
+        ctk.CTkLabel(f, text=title, font=RFONT).grid(row=0, column=0, columnspan=8, sticky="w", padx=14, pady=(10, 0))
+        ctk.CTkLabel(f, text=sub, text_color=MUTED).grid(row=1, column=0, columnspan=8, sticky="w", padx=14, pady=(0, 8))
+        return f
+
+    def rfield(f, r, c, label, width, value="", show=None, ph=""):
+        ctk.CTkLabel(f, text=label, text_color=MUTED).grid(row=r, column=c, sticky="e", padx=(14, 4), pady=4)
+        e = ctk.CTkEntry(f, width=width, show=show, placeholder_text=ph); e.insert(0, value); e.grid(row=r, column=c + 1, sticky="w", pady=4)
+        return e
+
+    def open_folder(path):
+        path = path.strip()
+        if not path:
+            return
+        os.makedirs(path, exist_ok=True)
+        if IS_WIN:
+            os.startfile(path)
+
+    def pick_dir(entry):
+        d = filedialog.askdirectory(title="Choose folder")
+        if d:
+            entry.delete(0, "end"); entry.insert(0, os.path.normpath(d)); save_rset()
+
+    def save_rset(*_):
+        teams_cfg["lat_dir"] = lat_dir.get().strip(); teams_cfg["iex_dir"] = iex_dir.get().strip(); persist()
+
+    def run_bg(btn, label, fn):
+        def worker():
+            try:
+                fn()
+            except Exception as e:  # noqa: BLE001
+                log(f"{label}: ✗ {e}")
+                root.after(0, lambda: messagebox.showerror(APP_NAME, f"{label} failed:\n{e}"))
+            finally:
+                root.after(0, lambda: btn.configure(state="normal", text=btn._orig))
+        btn._orig = btn.cget("text"); btn.configure(state="disabled", text="Running…")
+        threading.Thread(target=worker, daemon=True).start()
+
+    # LAT
+    lu, lp = RP.cred_get("RTA Runner/LAT")
+    lat = rcard(tab_r, "LAT export (cmclineadherence)", "Detailed Dashboard (Voice) and Chat Dashboard → CSV. Default date = today (EST).")
+    lat_user = rfield(lat, 2, 0, "Username", 160, lu)
+    lat_pw = rfield(lat, 2, 2, "Password", 160, lp, show="•")
+    lat_date = rfield(lat, 3, 0, "Date (MM/DD/YYYY)", 160, RP.today_est())
+    ctk.CTkButton(lat, text="Today", width=60, fg_color=("gray75", "#3a4150"), command=lambda: (lat_date.delete(0, "end"), lat_date.insert(0, RP.today_est()))).grid(row=3, column=2, sticky="w", padx=4)
+    lat_dir = rfield(lat, 4, 0, "Save to", 360, teams_cfg.get("lat_dir", r"C:\EG WFM Setup\Dumb_data\LAT_Realtime"))
+    ctk.CTkButton(lat, text="…", width=34, command=lambda: pick_dir(lat_dir)).grid(row=4, column=2, sticky="w", padx=4)
+    lat_v, lat_c = ctk.BooleanVar(value=True), ctk.BooleanVar(value=True)
+    kf = ctk.CTkFrame(lat, fg_color="transparent"); kf.grid(row=5, column=1, columnspan=3, sticky="w", pady=4)
+    ctk.CTkCheckBox(kf, text="Voice", variable=lat_v).pack(side="left", padx=(0, 12))
+    ctk.CTkCheckBox(kf, text="Chat", variable=lat_c).pack(side="left")
+    lbf = ctk.CTkFrame(lat, fg_color="transparent"); lbf.grid(row=6, column=0, columnspan=6, sticky="w", padx=14, pady=(6, 12))
+
+    def do_lat():
+        kinds = [k for k, v in (("Voice", lat_v), ("Chat", lat_c)) if v.get()]
+        if not kinds:
+            messagebox.showwarning(APP_NAME, "Tick Voice and/or Chat"); return
+        try:
+            d = RP.norm_date(lat_date.get())
+        except ValueError as e:
+            messagebox.showwarning(APP_NAME, str(e)); return
+        u, pw_ = lat_user.get().strip(), lat_pw.get()
+        if not u or not pw_:
+            messagebox.showwarning(APP_NAME, "Enter the LAT username and password"); return
+        try:
+            RP.cred_set("RTA Runner/LAT", u, pw_)
+        except Exception as e:  # noqa: BLE001
+            log(f"could not save LAT login: {e}")
+        save_rset()
+        run_bg(lat_btn, "LAT export", lambda: RP.run_lat(kinds, d, lat_dir.get().strip(), u, pw_, log))
+    lat_btn = ctk.CTkButton(lbf, text="Run LAT export", width=140, fg_color="#1f8a4c", hover_color="#187040", command=do_lat); lat_btn.pack(side="left")
+    ctk.CTkButton(lbf, text="Open folder", width=110, fg_color=("gray75", "#3a4150"), command=lambda: open_folder(lat_dir.get())).pack(side="left", padx=8)
+
+    # IEX
+    iu, ip = RP.cred_get("RTA Runner/IEX")
+    iex = rcard(tab_r, "IEX Agent Schedules (EG_MU · 1000 COMCAST_EG)", "NICE WFM webstation → schedule file for the dashboard. The site is slow: 2–5 min is normal.")
+    iex_user = rfield(iex, 2, 0, "Username", 160, iu)
+    iex_pw = rfield(iex, 2, 2, "Password", 160, ip, show="•")
+    iex_from = rfield(iex, 3, 0, "From (MM/DD/YYYY)", 160, RP.today_est())
+    iex_to = rfield(iex, 3, 2, "To", 160, RP.today_est())
+    ctk.CTkButton(iex, text="Today", width=60, fg_color=("gray75", "#3a4150"),
+                  command=lambda: [(e.delete(0, "end"), e.insert(0, RP.today_est())) for e in (iex_from, iex_to)]).grid(row=3, column=4, sticky="w", padx=4)
+    iex_dir = rfield(iex, 4, 0, "Save to", 360, teams_cfg.get("iex_dir", r"C:\EG WFM Setup\Dumb_data\SKD_Realtime"))
+    ctk.CTkButton(iex, text="…", width=34, command=lambda: pick_dir(iex_dir)).grid(row=4, column=2, sticky="w", padx=4)
+    ibf = ctk.CTkFrame(iex, fg_color="transparent"); ibf.grid(row=5, column=0, columnspan=6, sticky="w", padx=14, pady=(6, 12))
+
+    def do_iex():
+        try:
+            a, b = RP.norm_date(iex_from.get()), RP.norm_date(iex_to.get())
+        except ValueError as e:
+            messagebox.showwarning(APP_NAME, str(e)); return
+        u, pw_ = iex_user.get().strip(), iex_pw.get()
+        if not u or not pw_:
+            messagebox.showwarning(APP_NAME, "Enter the IEX username and password"); return
+        try:
+            RP.cred_set("RTA Runner/IEX", u, pw_)
+        except Exception as e:  # noqa: BLE001
+            log(f"could not save IEX login: {e}")
+        save_rset()
+        run_bg(iex_btn, "IEX export", lambda: RP.run_iex(a, b, iex_dir.get().strip(), u, pw_, log))
+    iex_btn = ctk.CTkButton(ibf, text="Run IEX export", width=140, fg_color="#1f8a4c", hover_color="#187040", command=do_iex); iex_btn.pack(side="left")
+    ctk.CTkButton(ibf, text="Open folder", width=110, fg_color=("gray75", "#3a4150"), command=lambda: open_folder(iex_dir.get())).pack(side="left", padx=8)
+    for e in (lat_dir, iex_dir):
+        e.bind("<FocusOut>", save_rset)
+    ctk.CTkLabel(tab_r, text="Logins are saved in Windows Credential Manager (not in any file). Uses the Edge already installed on this PC.",
+                 text_color=MUTED).pack(anchor="w", padx=12, pady=6)
 
     # ---------- log
     logf = ctk.CTkFrame(root, fg_color="transparent"); logf.pack(fill="x", padx=16, pady=(0, 4))
