@@ -234,12 +234,10 @@ class WebHost:
     async def _launch(self):
         self.state, self.error = "starting", ""
         try:
-            args = ["--disable-blink-features=AutomationControlled", "--start-maximized", "--no-default-browser-check"]
+            args = ["--start-maximized", "--no-default-browser-check"]
             if os.environ.get("RTA_DEBUG_PORT"):      # tests only
                 args.append(f"--remote-debugging-port={os.environ['RTA_DEBUG_PORT']}")
-            if self.app_mode:
-                args.append(f"--app={ORIGIN}/loading.html")
-            ignore = ["--enable-automation"] + (["about:blank"] if self.app_mode else [])   # start with ONLY the app window
+            ignore = ["--enable-automation"]
             kw = dict(user_data_dir=str(self.profile), headless=False, no_viewport=True, accept_downloads=True,
                       args=args, ignore_default_args=ignore,
                       chromium_sandbox=not bool(self.browser_exe))   # keep Edge's sandbox (no "--no-sandbox" warning bar)
@@ -261,7 +259,7 @@ class WebHost:
         # the dashboard ↔ app bridge, for every page of OUR origin only (CMS / Teams pages are refused)
         await self.ctx.expose_binding("rtaHost", self._rpc_binding)
         if self.app_mode:
-            await self._attach_app_window()
+            await self._open_app_window()
         else:
             first = self.ctx.pages[0] if self.ctx.pages else None
             await self._open_dash(reuse=first)
@@ -318,6 +316,34 @@ class WebHost:
         if not url.startswith(ORIGIN + "/"):
             return json.dumps({"err": "not allowed"})
         return await self._rpc(raw)
+
+    async def _open_app_window(self):
+        """App mode: the first (normal) window becomes the worker window (CMS / Teams tabs); the RTA window is a popup
+        window (no tabs, no address bar to type in) opened from it by a real click, so Edge doesn't block it."""
+        p0 = self.ctx.pages[0] if self.ctx.pages else await self.ctx.new_page()
+        try:
+            await p0.goto(ORIGIN + "/worker.html", wait_until="load", timeout=30000)
+            await p0.evaluate("""() => { const b = document.createElement('button'); b.id = '__rta_open'; b.textContent = 'Open the RTA window';
+              b.style.cssText = 'position:fixed;left:24px;top:24px;z-index:99999;padding:14px 22px;font:16px Segoe UI,Arial;border-radius:10px;border:0;background:#2a78d6;color:#fff;cursor:pointer';
+              b.onclick = () => { window.open('/dashboard.html', 'rta_app', 'popup=yes,left=0,top=0,width=' + screen.availWidth + ',height=' + screen.availHeight); };
+              document.body.appendChild(b); }""")
+            async with p0.expect_popup(timeout=20000) as pi:
+                await p0.click("#__rta_open", timeout=10000)
+            dash = await pi.value
+            try:
+                await dash.wait_for_load_state("load", timeout=30000)
+            except Exception:
+                pass
+            self._adopt_dash(dash, already_loaded=True)
+            self.log("RTA window open (the other window holds the CMS / Teams tabs — keep it open, it can sit behind)")
+            return
+        except Exception as e:  # noqa: BLE001
+            self.log(f"couldn't open the RTA popup window ({str(e).splitlines()[0][:120]}) — using a normal window")
+        try:
+            await p0.goto(DASH_URL, wait_until="load", timeout=60000)
+            self._adopt_dash(p0, already_loaded=True)
+        except Exception as e:  # noqa: BLE001
+            self.log(f"dashboard did not load: {e}")
 
     async def _attach_app_window(self):
         """App mode: Edge opened ONE app window on loading.html; that page switches itself to the dashboard as soon as the
