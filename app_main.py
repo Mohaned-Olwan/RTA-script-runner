@@ -1,11 +1,11 @@
 """
 RTA Script Runner v3 — one app.
 
-The RTA dashboard window IS the app (an Edge app-mode window: no address bar, own taskbar icon).
+v4: the app has its OWN window (pywebview → Windows WebView2 — no Edge, no browser frame) showing the RTA dashboard.
 Its tabs: the dashboard (Overview … Data & Setup), ⚙ Automation (CMS web + Teams web), and the app's own tabs
 (Scripts · Teams desktop · Reports). This module is the Python side underneath: script timers, the Teams desktop sender,
-LAT / IEX exports + timers, roster auto-load, settings and the log. A hidden Tk root only provides native dialogs
-(file pickers, the "close RTA?" question) and keeps the process alive.
+LAT / IEX exports + timers, roster auto-load, settings and the log. CMS web / Teams web run in the browser bundled
+with the app (a second "CMS + Teams" window, driven by web_host).
 
 Fallback: `RTA_Script_Runner.exe --classic` opens the old v2 window.
 """
@@ -31,44 +31,62 @@ from web_tab import local_dir, merge_lat, ago
 JOB_FIELDS = ("name", "path", "every_min", "start_at", "stop_at", "enabled", "target", "link", "hint", "every_status")
 
 
-class MainThread:
-    """Run callables on the Tk main thread (dialogs must live there)."""
+class NativeUI:
+    """Native dialogs + the app window (pywebview)."""
 
-    def __init__(self, root):
-        self.root = root
-        self.q: "queue.Queue" = queue.Queue()
-        root.after(100, self._pump)
+    def __init__(self):
+        self.window = None
+        self.ready = threading.Event()      # dashboard loaded in the window
 
-    def _pump(self):
-        while True:
-            try:
-                fn, box, ev = self.q.get_nowait()
-            except queue.Empty:
-                break
-            try:
-                box["v"] = fn()
-            except Exception as e:  # noqa: BLE001
-                box["e"] = e
-            if ev:
-                ev.set()
-        self.root.after(100, self._pump)
+    def ask_yes_no(self, msg) -> bool:
+        if RR.IS_WIN:
+            import ctypes
+            return ctypes.windll.user32.MessageBoxW(None, msg, RR.APP_NAME, 0x04 | 0x20 | 0x40000 | 0x10000) == 6   # YESNO|QUESTION|TOPMOST|SETFOREGROUND
+        return True
 
-    def call(self, fn, timeout=1800):
-        ev, box = threading.Event(), {}
-        self.q.put((fn, box, ev))
-        ev.wait(timeout)
-        if "e" in box:
-            raise box["e"]
-        return box.get("v")
+    def info(self, msg):
+        if RR.IS_WIN:
+            import ctypes
+            ctypes.windll.user32.MessageBoxW(None, msg, RR.APP_NAME, 0x40 | 0x40000 | 0x10000)
 
-    def post(self, fn):
-        self.q.put((fn, {}, None))
+    def _dialog(self, folder, title, types=()):
+        import webview
+        if not self.window:
+            return ""
+        FD = getattr(webview, "FileDialog", None)
+        kind = (FD.FOLDER if folder else FD.OPEN) if FD else (webview.FOLDER_DIALOG if folder else webview.OPEN_DIALOG)
+        try:
+            r = self.window.create_file_dialog(kind, allow_multiple=False, file_types=tuple(types)) if not folder else self.window.create_file_dialog(kind)
+        except Exception:
+            r = None
+        if not r:
+            return ""
+        return r[0] if isinstance(r, (list, tuple)) else r
+
+    def pick_file(self, title, kind):
+        types = ("Scripts (*.acsauto;*.bat;*.cmd;*.ps1;*.vbs;*.exe;*.py)", "All files (*.*)") if kind == "script" else \
+                ("Excel / CSV (*.xlsx;*.xlsb;*.xls;*.csv)", "All files (*.*)")
+        return self._dialog(False, title, types)
+
+    def pick_dir(self, title):
+        return self._dialog(True, title)
+
+    def run_js(self, js):
+        if self.window and self.ready.is_set():
+            return self.window.evaluate_js(js)
+        raise RuntimeError("the RTA window is not open")
+
+    def destroy(self):
+        try:
+            if self.window:
+                self.window.destroy()
+        except Exception:
+            pass
 
 
 class AppCore:
-    def __init__(self, root):
-        self.root = root
-        self.main = MainThread(root)
+    def __init__(self, ui: NativeUI):
+        self.ui = ui
         cfg = RR.load_config()
         self.jobs: list[RR.Job] = cfg["jobs"]
         self.autostart: bool = cfg["autostart"]
@@ -81,11 +99,12 @@ class AppCore:
         self.sender = TS.TeamsSender(self.log, self.teams_settings)
         self.sched.sender = self.sender
         self.sched.set_jobs(self.jobs)
-        self.host = WH.WebHost(local_dir(), log=lambda m: self.log("[RTA] " + m), app_mode=True)
+        self.host = WH.WebHost(local_dir(), log=lambda m: self.log("[CMS+Teams browser] " + m), native=True)
         self.host.app_handler = self.rpc
-        self.host.dialog_handler = self.on_dialog
-        self.host.on_user_close = lambda: self.main.post(self.quit)
+        self.host.dash_send = self._dash_send
+        self.host.dash_load = self._dash_load
         self.host.on_ready.append(self._browser_ready)
+        self.rpc_calls = 0
         self.busy = {"lat": False, "iex": False, "roster": False}
         self.last = {"lat": float(self.tcfg.get("rep_last_lat", 0) or 0), "iex": float(self.tcfg.get("rep_last_iex", 0) or 0), "roster": 0.0}
         self.rep_msg = {"lat": "", "iex": "", "roster": ""}
@@ -134,20 +153,6 @@ class AppCore:
                 time.sleep(2)
                 self.start_kind("script"); self.start_kind("teams")
             threading.Thread(target=go, daemon=True).start()
-        self.root.after(1000, self._watch)
-
-    def _watch(self):
-        """Edge could not start → tell the user once and offer the classic window."""
-        if self.quitting:
-            return
-        if self.host.state == "error" and not getattr(self, "_warned", False):
-            self._warned = True
-            from tkinter import messagebox
-            if self._ask(lambda p: messagebox.askyesno(RR.APP_NAME, f"The RTA window (Edge) could not open:\n{self.host.error}\n\n"
-                                                                    "Open the classic RTA Script Runner window instead?", parent=p)):
-                self.open_classic()
-                return
-        self.root.after(2000, self._watch)
 
     def open_classic(self):
         try:
@@ -167,33 +172,28 @@ class AppCore:
             self.host.shutdown()
         except Exception:
             pass
-        try:
-            self.root.quit()
-        except Exception:
-            pass
+        self.ui.destroy()
 
-    def _ask(self, fn):
-        """Show a native dialog on top of the RTA window (main thread only)."""
-        import tkinter as tk
-        top = tk.Toplevel(self.root)
-        top.overrideredirect(True); top.geometry("1x1+300+300"); top.attributes("-topmost", True)
-        top.lift(); top.focus_force(); top.update()
-        try:
-            return fn(top)
-        finally:
-            top.destroy()
+    def busy_now(self) -> bool:
+        st = self.state()
+        web = (self.host.store.get("rta_cfg_auto").get("rta_cfg_auto") or {}).get("running") or {}
+        return bool(st["busyAny"] or web.get("cms") or web.get("teams"))
 
-    def on_dialog(self, kind, message, default=""):
-        """JS dialogs from the dashboard (runs in a worker thread). Returns True/False (or text for prompt)."""
-        from tkinter import messagebox, simpledialog
-        if kind == "beforeunload":
-            return self.main.call(lambda: self._ask(lambda p: messagebox.askyesno(
-                RR.APP_NAME, "Automation is running (CMS / Teams / scripts / report timers).\n\nClose RTA anyway? Everything stops until you open it again.", parent=p)))
-        if kind == "confirm":
-            return self.main.call(lambda: self._ask(lambda p: messagebox.askokcancel(RR.APP_NAME, message, parent=p)))
-        if kind == "prompt":
-            return self.main.call(lambda: self._ask(lambda p: simpledialog.askstring(RR.APP_NAME, message, initialvalue=default, parent=p)))
-        self.main.call(lambda: self._ask(lambda p: messagebox.showinfo(RR.APP_NAME, message, parent=p)))
+    # dashboard window helpers (called from worker threads)
+    def _dash_send(self, msg):
+        import json as _j
+        return self.ui.run_js(f"window.rtaApp ? window.rtaApp.send({_j.dumps(msg)}) : null")
+
+    def _dash_load(self, kind, paths):
+        import base64, json as _j
+        files = []
+        for p in paths:
+            with open(p, "rb") as f:
+                files.append({"name": os.path.basename(p), "b64": base64.b64encode(f.read()).decode()})
+        self.ui.run_js("(async (kind, files) => { for (const f of files) { const bin = atob(f.b64), u8 = new Uint8Array(bin.length);"
+                       " for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i); await loadDayFile(new File([u8], f.name), kind); }"
+                       " compute(); renderAll(); return true; })(" + _j.dumps(kind) + ", " + _j.dumps(files) + ")")
+        time.sleep(1.5)
         return True
 
     def _hotkey(self):
@@ -278,7 +278,7 @@ class AppCore:
         return max(0.25, float(self.rp()[kind + "_every_h"])) * 3600
 
     def load_files(self, kind, paths):
-        if not paths or not self.rp()["load_dash"] or self.host.state != "open":
+        if not paths or not self.rp()["load_dash"] or not self.ui.ready.is_set():
             return False
         if kind == "lat" and len(paths) > 1:
             paths = [merge_lat(paths, str(local_dir() / "LAT_for_dashboard.csv"))]
@@ -326,7 +326,7 @@ class AppCore:
                 p = r["roster"]
                 if not p or not os.path.exists(p):
                     raise RuntimeError("roster file not found")
-                if self.host.state != "open":
+                if not self.ui.ready.is_set():
                     raise RuntimeError("the RTA window is not open")
                 self.host.load_day_files("roster", [p])
                 st = os.stat(p)
@@ -356,7 +356,7 @@ class AppCore:
                 for k in ("lat", "iex"):
                     if r[k + "_on"] and not self.busy[k] and now - self.last[k] >= self._every(k):
                         threading.Thread(target=self.run_report, args=(k,), daemon=True).start()
-                if r["roster_on"] and not self.busy["roster"] and self.host.state == "open":
+                if r["roster_on"] and not self.busy["roster"] and self.ui.ready.is_set():
                     p = r["roster"]
                     if p and os.path.exists(p):
                         st = os.stat(p)
@@ -461,14 +461,10 @@ class AppCore:
         if op == "setAutostart":
             self.autostart = bool(a.get("on")); self.persist(); return True
         if op == "pickFile":
-            from tkinter import filedialog
-            ft = [("Scripts", "*.acsauto *.bat *.cmd *.ps1 *.vbs *.exe *.py"), ("All files", "*.*")] if a.get("type") == "script" else \
-                 [("Excel / CSV", "*.xlsx *.xlsb *.xls *.csv"), ("All files", "*.*")]
-            p = self.main.call(lambda: self._ask(lambda top: filedialog.askopenfilename(parent=top, title=a.get("title", "Choose a file"), filetypes=ft)))
+            p = self.ui.pick_file(a.get("title", "Choose a file"), a.get("type"))
             return os.path.normpath(p) if p else ""
         if op == "pickDir":
-            from tkinter import filedialog
-            p = self.main.call(lambda: self._ask(lambda top: filedialog.askdirectory(parent=top, title=a.get("title", "Choose folder"))))
+            p = self.ui.pick_dir(a.get("title", "Choose folder"))
             return os.path.normpath(p) if p else ""
         if op == "openFolder":
             p = (a.get("path") or "").strip()
@@ -507,7 +503,7 @@ class AppCore:
             threading.Thread(target=self.run_report, args=(kind, a, True), daemon=True).start()
             return None
         if op == "classic":
-            self.main.post(self.open_classic); return True
+            threading.Thread(target=self.open_classic, daemon=True).start(); return True
         raise RuntimeError(f"unknown app op {op}")
 
 
@@ -524,28 +520,115 @@ def port_free() -> bool:
         s.close()
 
 
+class Api:
+    """window.pywebview.api — the dashboard's bridge to Python (each call runs in its own thread)."""
+
+    def __init__(self, core: "AppCore"):
+        self._core = core
+
+    def rpc(self, raw):
+        import json as _j
+        core = self._core
+        try:
+            m = _j.loads(raw)
+            op, a = m.get("op"), m.get("a")
+            core.rpc_calls += 1
+            if op and op.startswith("app."):
+                v = core.rpc(op, a)
+            elif op == "storage.get":
+                v = core.host.store.get(a)
+            elif op == "storage.set":
+                core.host.store.set(a); v = None
+            elif op == "storage.remove":
+                core.host.store.remove(a); v = None
+            else:
+                core.host.start()
+                while core.host.loop is None:
+                    time.sleep(0.05)
+                v = core.host.call(core.host._op(op, a), timeout=120)
+            return _j.dumps({"v": v})
+        except Exception as e:  # noqa: BLE001
+            return _j.dumps({"err": (str(e).splitlines() or [e.__class__.__name__])[0][:400]})
+
+
 def main():
-    import tkinter as tk
-    from tkinter import messagebox
-    root = tk.Tk()
-    root.withdraw()
-    root.title(RR.APP_NAME)
+    import webview
+    smoke = "--smoke" in sys.argv
+    ui = NativeUI()
     if not port_free():
-        messagebox.showinfo(RR.APP_NAME, "RTA is already running (look for the RTA window on the taskbar).")
-        root.destroy()
+        ui.info("RTA is already running (look for the RTA window on the taskbar).")
         return
-    try:
-        core = AppCore(root)
+    core = AppCore(ui)
+    core.host.start()
+    if not core.host.server_ready.wait(30):
+        ui.info("RTA could not start its local page server.")
+        return
+    win = webview.create_window(f"RTA Realtime · Comcast EG  ·  {RR.APP_NAME} {RR.APP_VERSION}", WH.DASH_URL, js_api=Api(core),
+                                width=1500, height=950, min_size=(1100, 650), maximized=not smoke, text_select=True)
+    ui.window = win
+    win.events.loaded += lambda *a: ui.ready.set()
+
+    def on_closing(*a):
+        if core.quitting or smoke:
+            return True
+        try:
+            busy = core.busy_now()
+        except Exception:
+            busy = False
+        if busy and not ui.ask_yes_no("Automation is running (CMS / Teams / scripts / report timers).\n\nClose RTA anyway? Everything stops until you open it again."):
+            return False
+        threading.Thread(target=core.quit, daemon=True).start()
+        return True
+    win.events.closing += on_closing
+
+    def after_start():
         core.start()
-    except Exception as e:  # noqa: BLE001
-        if messagebox.askyesno(RR.APP_NAME, f"RTA could not start:\n{e}\n\nOpen the classic window instead?"):
-            root.destroy()
-            RR.run_app()
-            return
-        root.destroy()
-        return
-    root.mainloop()
+        if smoke:
+            threading.Thread(target=_smoke, args=(core, ui), daemon=True).start()
+
+    storage = str(local_dir() / "AppWindow")
+    started = threading.Event()
+    win.events.shown += lambda *a: started.set()
+    failed = None
     try:
-        root.destroy()
+        # Windows: WebView2 only (never the old IE engine). If WebView2 can't start, fall back to the classic window.
+        webview.start(after_start, private_mode=False, storage_path=storage, gui="edgechromium" if RR.IS_WIN else None)
+    except Exception as e:  # noqa: BLE001
+        failed = e
+    finally:
+        if not core.quitting:
+            core.quit()
+    if failed is not None and not started.is_set():
+        core.log(f"the RTA window (WebView2) could not start: {failed} — opening the classic window instead")
+        try:
+            core.host.thread and core.host.thread.join(15)
+        except Exception:
+            pass
+        if not smoke:
+            RR.run_app()
+
+
+def _smoke(core, ui):
+    """`--smoke`: the build machine checks the finished app end to end, then quits."""
+    import json as _j
+    t0, res = time.time(), {"ok": False}
+    while time.time() - t0 < 150:
+        try:
+            info = ui.run_js("JSON.stringify([location.pathname, document.querySelectorAll('.tab').length, !!window.__RTA_NATIVE, typeof window.rtaApp])") if ui.ready.is_set() else None
+        except Exception as e:  # noqa: BLE001
+            info = f"err {e}"
+        res = {"ok": False, "page": info, "rpc_calls": core.rpc_calls, "browser": core.host.state, "browser_error": core.host.error}
+        try:
+            v = _j.loads(info) if isinstance(info, str) and info.startswith("[") else None
+        except Exception:
+            v = None
+        if v and v[0] == "/dashboard.html" and v[1] >= 11 and v[2] and core.rpc_calls >= 3 and core.host.state == "open":
+            res["ok"] = True
+            break
+        time.sleep(2)
+    try:
+        (local_dir() / "smoke.json").write_text(_j.dumps(res), encoding="utf-8")
     except Exception:
         pass
+    core.log(f"SMOKE {'PASS' if res['ok'] else 'FAIL'}: {res}")
+    core.quit()

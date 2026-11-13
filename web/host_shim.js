@@ -89,4 +89,6 @@
   window.rtaApp = { send: m => UI.runtime.sendMessage(m), call: (op, a) => host(op, a) };   // engine messages + app (Python) calls
   // tell the app the window is closing (so closing the RTA window quits the app instead of reopening it)
   window.addEventListener('pagehide', () => { try { navigator.sendBeacon('/bye', '1'); } catch (e) { } });
+  // native window (v4): tell the app the dashboard (re)started, so old CMS / Teams tabs are dropped
+  if (window.__RTA_NATIVE) host('host.dashLoaded', {}).catch(() => { });
 })();

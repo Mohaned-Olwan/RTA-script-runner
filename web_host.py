@@ -32,6 +32,8 @@ def web_dir() -> Path:
 
 
 # ----------------------------------------------------------------------------- local web server for the dashboard
+DASH_TAB_ID = 1
+DASH_TAB = {"id": DASH_TAB_ID, "windowId": 1, "status": "complete", "url": DASH_URL, "title": "RTA", "active": True, "discarded": False, "pinned": True, "index": 0}
 LAST_BYE = [0.0]      # time the dashboard page said goodbye (window closing or reloading)
 
 
@@ -110,7 +112,7 @@ class Store:
 
 # ----------------------------------------------------------------------------- the host
 class WebHost:
-    def __init__(self, data_dir: Path, log=print, browser_exe: str | None = None, app_mode: bool = False):
+    def __init__(self, data_dir: Path, log=print, browser_exe: str | None = None, app_mode: bool = False, native: bool = False):
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.profile = self.data_dir / "BrowserProfile"
@@ -138,6 +140,11 @@ class WebHost:
         self.dialog_handler = None             # callable(kind, message, default) → bool / text, for dialogs on the dashboard
         self.on_user_close = None              # called when the user closed the app window
         self._internal = False                 # we are closing pages ourselves
+        self.native = native                   # v4: the dashboard lives in the app's own window (WebView2); this browser only holds CMS / Teams
+        self.dash_send = None                  # native: callable(msg) → result, runs the message in the dashboard window
+        self.dash_load = None                  # native: callable(kind, paths), loads day files into the dashboard window
+        self._dash_loads = 0
+        self.server_ready = threading.Event()
 
     # ---------- thread plumbing
     def start(self):
@@ -208,13 +215,14 @@ class WebHost:
     async def _main(self):
         from playwright.async_api import async_playwright
         self.server = start_server(web_dir())
+        self.server_ready.set()
         self.pw = await async_playwright().start()
         last_flush = 0.0
         while not self.quit:
             try:
                 if self.want_open and self.ctx is None:
                     await self._launch()
-                if self.ctx is not None and (self.dash is None or self.dash.is_closed()):
+                if self.ctx is not None and not self.native and (self.dash is None or self.dash.is_closed()):
                     if self.app_mode:
                         if not self._user_closed():     # the app window vanished without the user closing it → restart the browser
                             self.log("RTA window lost — restarting it")
@@ -239,6 +247,10 @@ class WebHost:
         await self._close_ctx()
         await self.pw.stop()
         self.server.shutdown()
+        try:
+            self.server.server_close()       # free the port (the classic fallback may need it)
+        except Exception:
+            pass
 
     async def _launch(self):
         self.state, self.error = "starting", ""
@@ -265,7 +277,13 @@ class WebHost:
         self.pages.clear(); self.meta.clear(); self.ids.clear()
         # the dashboard ↔ app bridge, for every page of OUR origin only (CMS / Teams pages are refused)
         await self.ctx.expose_binding("rtaHost", self._rpc_binding)
-        if self.app_mode:
+        if self.native:
+            p0 = self.ctx.pages[0] if self.ctx.pages else await self.ctx.new_page()
+            try:
+                await p0.goto(ORIGIN + "/worker.html", wait_until="load", timeout=30000)
+            except Exception:
+                pass
+        elif self.app_mode:
             await self._open_app_window()
         else:
             first = self.ctx.pages[0] if self.ctx.pages else None
@@ -283,6 +301,10 @@ class WebHost:
         self.pages.clear(); self.meta.clear(); self.ids.clear()
         self.state = "closed"
         if self._internal or self.quit:
+            return
+        if self.native:
+            if self.want_open:
+                self.log("CMS + Teams window was closed — reopening it")
             return
         if self.app_mode and self._user_closed():
             self.want_open = False
@@ -433,12 +455,12 @@ class WebHost:
 
     async def _close_others(self):
         for tid, p in list(self.pages.items()):
-            if p is not self.dash:
+            if p is not self.dash and not (p.url or "").endswith("/worker.html"):
                 try:
                     await p.close()
                 except Exception:
                     pass
-        self.log("Dashboard reloaded — automation restarted with fresh tabs")
+        self.log("Dashboard reloaded — automation restarted with fresh CMS / Teams tabs")
 
     # ---------- tabs
     def _register(self, page):
@@ -521,6 +543,13 @@ class WebHost:
             self.store.set(a); return None
         if op == "storage.remove":
             self.store.remove(a); return None
+        if op == "host.dashLoaded":          # native: the dashboard (re)loaded → its engine starts fresh → drop old CMS / Teams tabs
+            self._dash_loads += 1
+            if self._dash_loads > 1:
+                await self._close_others()
+            return True
+        if self.native and op in ("tabs.get", "tabs.update") and int((a[0] if isinstance(a, list) else a) or 0) == DASH_TAB_ID:
+            return dict(DASH_TAB)
         if op == "tabs.create":
             return await self._tab(await self._new_tab((a or {}).get("url")))
         if op == "tabs.get":
@@ -550,7 +579,7 @@ class WebHost:
             return None
         if op == "tabs.query":
             q = a or {}
-            out = []
+            out = [dict(DASH_TAB)] if self.native and (not q.get("url") or fnmatch.fnmatch(DASH_URL, q["url"])) else []
             for tid in list(self.pages):
                 try:
                     t = await self._tab(tid)
@@ -592,6 +621,10 @@ class WebHost:
 
     # ---------- app → dashboard
     async def _send(self, msg):
+        if self.native:
+            if not self.dash_send:
+                raise RuntimeError("the RTA window is not open")
+            return await asyncio.get_running_loop().run_in_executor(None, self.dash_send, msg)
         if not self.dash or self.dash.is_closed():
             raise RuntimeError("the RTA browser is not open")
         return await self.dash.evaluate("m => window.rtaApp ? window.rtaApp.send(m) : null", msg)
@@ -607,6 +640,10 @@ class WebHost:
             pass
 
     async def _load_files(self, kind, paths):
+        if self.native:
+            if not self.dash_load:
+                raise RuntimeError("the RTA window is not open")
+            return await asyncio.get_running_loop().run_in_executor(None, self.dash_load, kind, paths)
         if not self.dash or self.dash.is_closed():
             raise RuntimeError("the RTA browser is not open")
         await self.dash.set_input_files(f"input[type=file][data-kind={kind}]", paths)

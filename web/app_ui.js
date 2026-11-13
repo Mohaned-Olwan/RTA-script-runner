@@ -30,7 +30,7 @@
   setInterval(poll, 1500);
   window.onPageRender = page => { if (PAGES[page]) { if (ST.s) PAGES[page](); poll(); } };
   // ask before closing the window while anything runs (the app answers with a native dialog)
-  window.addEventListener('beforeunload', e => {
+  if (!window.__RTA_NATIVE) window.addEventListener('beforeunload', e => {   // native window: the app asks itself
     let web = false; try { web = !!(window.__rtaWebRunning); } catch (x) { }
     if (window.__rtaBusy || web) { e.preventDefault(); e.returnValue = ''; }
   });

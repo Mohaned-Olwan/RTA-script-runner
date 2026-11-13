@@ -14,11 +14,21 @@ jobs:
           python -m playwright install chromium
       - name: Smoke test on Windows (RTA window + dashboard bridge, bundled browser)
         run: python ci_smoke.py
-      - run: python -m PyInstaller --noconfirm --onedir --windowed --name RTA_Script_Runner --collect-all customtkinter --hidden-import teams_sender --hidden-import reports --hidden-import web_host --hidden-import web_tab --hidden-import sched_util --hidden-import app_main --hidden-import browser_util --collect-all uiautomation --hidden-import comtypes.stream --collect-data tzdata --add-data "web;web" --hidden-import PIL.BmpImagePlugin --collect-all playwright rta_runner.py
+      - run: python -m PyInstaller --noconfirm --onedir --windowed --name RTA_Script_Runner --collect-all customtkinter --hidden-import teams_sender --hidden-import reports --hidden-import web_host --hidden-import web_tab --hidden-import sched_util --hidden-import app_main --hidden-import browser_util --collect-all uiautomation --hidden-import comtypes.stream --collect-data tzdata --add-data "web;web" --hidden-import PIL.BmpImagePlugin --collect-all playwright --collect-all webview --collect-all clr_loader --collect-all pythonnet --hidden-import clr rta_runner.py
       - name: Check the browser is inside the package
         run: |
           $c = Get-ChildItem -Recurse dist\RTA_Script_Runner -Filter chrome.exe | Select-Object -First 1
           if (-not $c) { throw "bundled chrome.exe missing" }
           Write-Host "bundled browser:" $c.FullName
+      - name: Self-test the finished exe (its own RTA window + CMS/Teams browser + bridge)
+        run: |
+          $p = Start-Process dist\RTA_Script_Runner\RTA_Script_Runner.exe -ArgumentList "--smoke" -PassThru
+          if (-not $p.WaitForExit(240000)) { $p.Kill(); throw "the app did not finish its self-test" }
+          $log = Join-Path $env:APPDATA "RTA Runner\runner.log"
+          if (Test-Path $log) { Get-Content $log -Tail 25 }
+          $f = Join-Path $env:LOCALAPPDATA "RTA Runner\web\smoke.json"
+          if (-not (Test-Path $f)) { throw "no self-test result" }
+          Get-Content $f
+          if (-not ((Get-Content $f -Raw | ConvertFrom-Json).ok)) { throw "self-test FAILED" }
       - uses: actions/upload-artifact@v4
         with: { name: RTA_Script_Runner, path: dist/RTA_Script_Runner }
