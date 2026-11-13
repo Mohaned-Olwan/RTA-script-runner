@@ -1,5 +1,11 @@
 # RTA Script Runner
 
+## v3.1 — its own browser
+The app now drives the **browser bundled inside it** (Chromium) instead of the installed Edge: on the company PCs Edge ignores the
+app's profile folder (IT policy), hands every launch to your open Edge and closes, so Edge can't be automated there.
+Download = a **folder** (zip): extract it and run `RTA_Script_Runner.exe` inside; keep the folder together. Sign in to Teams once in the app's window.
+`RTA_BROWSER=edge` (environment variable) switches back to Edge.
+
 ## v3.0 — one app
 Opening `RTA_Script_Runner.exe` opens **one RTA window** (an Edge app window — no address bar, own taskbar icon): the dashboard tabs
 (Overview · LOB View · Legacy view · Day plan · Agents & Flags · Scheduled off · Data & Setup), **⚙ Automation** (CMS web + Teams web),

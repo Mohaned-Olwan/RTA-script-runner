@@ -113,7 +113,7 @@ class WebHost:
     def __init__(self, data_dir: Path, log=print, browser_exe: str | None = None, app_mode: bool = False):
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
-        self.profile = self.data_dir / "EdgeProfile"
+        self.profile = self.data_dir / "BrowserProfile"
         self.store = Store(self.data_dir / "web_store.json")
         self.log = log
         self.browser_exe = browser_exe or os.environ.get("RTA_BROWSER_EXE")
@@ -211,15 +211,24 @@ class WebHost:
         self.pw = await async_playwright().start()
         last_flush = 0.0
         while not self.quit:
-            if self.want_open and self.ctx is None:
-                await self._launch()
-            if self.ctx is not None and (self.dash is None or self.dash.is_closed()):
-                if self.app_mode:
-                    if not self._user_closed():     # the app window vanished without the user closing it → restart Edge
-                        self.log("RTA window lost — restarting it")
-                        await self._close_ctx()
-                else:
-                    await self._open_dash(restart=True)
+            try:
+                if self.want_open and self.ctx is None:
+                    await self._launch()
+                if self.ctx is not None and (self.dash is None or self.dash.is_closed()):
+                    if self.app_mode:
+                        if not self._user_closed():     # the app window vanished without the user closing it → restart the browser
+                            self.log("RTA window lost — restarting it")
+                            await self._close_ctx()
+                    else:
+                        await self._open_dash(restart=True)
+            except Exception as e:  # noqa: BLE001  — never let the host stop; reset and try again
+                self.log(f"browser problem: {str(e).splitlines()[0][:200]} — restarting it in 10 s")
+                try:
+                    await self._close_ctx()
+                except Exception:
+                    pass
+                self.ctx, self.dash = None, None
+                await asyncio.sleep(10)
             if time.time() - last_flush > 3:
                 last_flush = time.time()
                 try:
@@ -240,16 +249,14 @@ class WebHost:
             ignore = ["--enable-automation"]
             kw = dict(user_data_dir=str(self.profile), headless=False, no_viewport=True, accept_downloads=True,
                       args=args, ignore_default_args=ignore,
-                      chromium_sandbox=not bool(self.browser_exe))   # keep Edge's sandbox (no "--no-sandbox" warning bar)
-            if self.browser_exe:
-                kw["executable_path"] = self.browser_exe
-            else:
-                kw["channel"] = "msedge"
+                      chromium_sandbox=sys.platform.startswith("win"))   # keep the sandbox on Windows (no "--no-sandbox" warning bar)
+            import browser_util
+            kw.update(browser_util.launch_kwargs())
             self.ctx = await self.pw.chromium.launch_persistent_context(**kw)
         except Exception as e:  # noqa: BLE001
             self.ctx = None
             self.state, self.error = "error", str(e).splitlines()[0][:300]
-            self.log(f"RTA browser: could not open Edge — {self.error}")
+            self.log(f"RTA browser: could not open the browser — {self.error}")
             await asyncio.sleep(10)
             return
         self.ctx.on("close", lambda *_: self._on_ctx_close())

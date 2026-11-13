@@ -20,7 +20,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 APP_NAME = "RTA Script Runner"
-APP_VERSION = "3.0.2"
+APP_VERSION = "3.1"
 IS_WIN = sys.platform.startswith("win")
 
 
@@ -960,6 +960,8 @@ def run_app():
 
 
 if __name__ == "__main__":
+    import browser_util
+    browser_util.setup_env()
     if "--classic" in sys.argv:
         run_app()                 # the v2 window (fallback)
     else:

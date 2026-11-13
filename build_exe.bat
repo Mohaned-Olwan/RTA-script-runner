@@ -4,7 +4,9 @@ REM The work laptop only needs the finished .exe from the "dist" folder - nothin
 cd /d "%~dp0"
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
-python -m PyInstaller --noconfirm --onefile --windowed --name "RTA_Script_Runner" --collect-all customtkinter --hidden-import teams_sender --hidden-import reports --hidden-import web_host --hidden-import web_tab --hidden-import sched_util --hidden-import app_main --collect-all uiautomation --hidden-import comtypes.stream --collect-data tzdata --add-data "web;web" --hidden-import PIL.BmpImagePlugin --collect-all playwright rta_runner.py
+set PLAYWRIGHT_BROWSERS_PATH=0
+python -m playwright install chromium
+python -m PyInstaller --noconfirm --onedir --windowed --name "RTA_Script_Runner" --collect-all customtkinter --hidden-import teams_sender --hidden-import reports --hidden-import web_host --hidden-import web_tab --hidden-import sched_util --hidden-import app_main --hidden-import browser_util --collect-all uiautomation --hidden-import comtypes.stream --collect-data tzdata --add-data "web;web" --hidden-import PIL.BmpImagePlugin --collect-all playwright rta_runner.py
 echo.
-echo Done. Your app is in: %~dp0dist\RTA_Script_Runner.exe
+echo Done. Your app is in: %~dp0dist\RTA_Script_Runner\ (run RTA_Script_Runner.exe inside it; keep the folder together)
 pause

@@ -4,7 +4,7 @@ Report exporters for RTA Script Runner (Reports tab).
 - LAT export (Voice "Detailed Dashboard" / Chat "Chat Dashboard") from cmclineadherence.com → CSV
 - IEX "Agent Schedules" (EG_MU set) from the VXI NICE WFM webstation
 
-Uses the Microsoft Edge already installed on the PC (Playwright channel="msedge"), headless.
+Uses the browser bundled with the app (Playwright Chromium), headless; Edge as a fallback.
 Logins are kept in Windows Credential Manager (never in code / config files).
 """
 from __future__ import annotations
@@ -133,10 +133,12 @@ def xlsx_to_csv(xlsx: str, csv_path: str):
 
 
 def _browser(p, headless=True):
+    """The browser bundled with the app (company Edge policies don't apply to it); Edge only as a fallback."""
+    import browser_util
     try:
-        return p.chromium.launch(channel="msedge", headless=headless)
+        return p.chromium.launch(headless=headless, **browser_util.launch_kwargs())
     except Exception:
-        return p.chromium.launch(headless=headless)   # dev fallback (bundled chromium)
+        return p.chromium.launch(channel="msedge", headless=headless)
 
 
 # ----------------------------------------------------------------------------- LAT
