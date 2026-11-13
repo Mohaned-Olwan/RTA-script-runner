@@ -20,7 +20,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 APP_NAME = "RTA Script Runner"
-APP_VERSION = "3.0"
+APP_VERSION = "3.0.1"
 IS_WIN = sys.platform.startswith("win")
 
 

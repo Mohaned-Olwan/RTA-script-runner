@@ -241,7 +241,8 @@ class WebHost:
                 args.append(f"--app={ORIGIN}/loading.html")
             ignore = ["--enable-automation"] + (["about:blank"] if self.app_mode else [])   # start with ONLY the app window
             kw = dict(user_data_dir=str(self.profile), headless=False, no_viewport=True, accept_downloads=True,
-                      args=args, ignore_default_args=ignore)
+                      args=args, ignore_default_args=ignore,
+                      chromium_sandbox=not bool(self.browser_exe))   # keep Edge's sandbox (no "--no-sandbox" warning bar)
             if self.browser_exe:
                 kw["executable_path"] = self.browser_exe
             else:
@@ -257,8 +258,13 @@ class WebHost:
         self.ctx.on("page", self._register)
         await self.ctx.add_init_script(path=str(web_dir() / "init.js"))
         self.pages.clear(); self.meta.clear(); self.ids.clear()
-        first = self.ctx.pages[0] if self.ctx.pages else None
-        await self._open_dash(reuse=first)
+        # the dashboard ↔ app bridge, for every page of OUR origin only (CMS / Teams pages are refused)
+        await self.ctx.expose_binding("rtaHost", self._rpc_binding)
+        if self.app_mode:
+            await self._attach_app_window()
+        else:
+            first = self.ctx.pages[0] if self.ctx.pages else None
+            await self._open_dash(reuse=first)
         self.state = "open"
         self.log("RTA browser open — sign in to Teams there once (it stays signed in)")
         for cb in list(self.on_ready):
@@ -304,6 +310,59 @@ class WebHost:
         self.state = "closed"
         self._internal = False
 
+    async def _rpc_binding(self, source, raw):
+        try:
+            url = source["frame"].url
+        except Exception:
+            url = ""
+        if not url.startswith(ORIGIN + "/"):
+            return json.dumps({"err": "not allowed"})
+        return await self._rpc(raw)
+
+    async def _attach_app_window(self):
+        """App mode: Edge opened ONE app window on loading.html; that page switches itself to the dashboard as soon as the
+        bridge exists. Find that page (whenever Edge reports it) and adopt it as the dashboard."""
+        end = time.time() + 45
+        nudged = False
+        while time.time() < end and self.ctx is not None:
+            pages = [p for p in self.ctx.pages if not p.is_closed()]
+            dash = next((p for p in pages if p.url.startswith(DASH_URL)), None)
+            if dash:
+                try:
+                    await dash.wait_for_load_state("load", timeout=30000)
+                except Exception:
+                    pass
+                self._adopt_dash(dash, already_loaded=True)
+                return
+            if not nudged and time.time() > end - 30:      # 15 s and still on the loading page → push it
+                for p in pages:
+                    if p.url.startswith(ORIGIN + "/loading"):
+                        nudged = True
+                        try:
+                            await p.goto(DASH_URL, wait_until="load", timeout=30000)
+                        except Exception:
+                            pass
+            await asyncio.sleep(0.4)
+        self.log("RTA window did not show up — opening the dashboard in a normal window")
+        await self._open_dash()
+
+    def _adopt_dash(self, p, already_loaded=False):
+        tid = self._register(p)
+        self.meta[tid]["pinned"] = True
+        self.meta[tid]["status"] = "complete"
+        self.dash = p
+        loads = {"n": 1 if already_loaded else 0}
+
+        def on_dash_load(*_):   # the dashboard was reloaded (F5) → the engine restarts → drop its old tabs
+            loads["n"] += 1
+            LAST_BYE[0] = 0.0
+            if loads["n"] > 1:
+                asyncio.ensure_future(self._close_others())
+        p.on("domcontentloaded", on_dash_load)
+        p.on("dialog", lambda d: asyncio.ensure_future(self._dialog(d)))
+        p.on("close", lambda pg: self._on_dash_close(pg))
+        LAST_BYE[0] = 0.0
+
     async def _open_dash(self, reuse=None, restart=False):
         if restart:   # engine restarts with a fresh page → its old tabs are unknown to it: close them
             if self.app_mode and self._user_closed():
@@ -316,25 +375,11 @@ class WebHost:
             self.pages.clear(); self.meta.clear(); self.ids.clear()
             self.log("Dashboard page reopened — automation restarted")
         p = reuse if reuse and not reuse.is_closed() else await self.ctx.new_page()
-        await p.expose_function("rtaHost", self._rpc)
-        tid = self._register(p)
-        self.meta[tid]["pinned"] = True
-        self.dash = p
-        loads = {"n": 0}
-
-        def on_dash_load(*_):   # the dashboard was reloaded (F5) → the engine restarts → drop its old tabs
-            loads["n"] += 1
-            LAST_BYE[0] = 0.0
-            if loads["n"] > 1:
-                asyncio.ensure_future(self._close_others())
-        p.on("domcontentloaded", on_dash_load)
-        p.on("dialog", lambda d: asyncio.ensure_future(self._dialog(d)))
-        p.on("close", lambda pg: self._on_dash_close(pg))
+        self._adopt_dash(p)
         try:
             await p.goto(DASH_URL, wait_until="load", timeout=60000)
         except Exception as e:  # noqa: BLE001
             self.log(f"dashboard did not load: {e}")
-        self.meta[tid]["status"] = "complete"
 
     async def _dialog(self, d):
         try:
