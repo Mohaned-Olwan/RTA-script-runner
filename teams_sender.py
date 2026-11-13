@@ -51,16 +51,19 @@ def load_manifest(out_dir: str) -> dict:
 
 
 def pictures_for(out_dir: str, target: str, max_age_min: float, now: datetime | None = None):
-    """Return (view_path, flags_path, None) or (None, None, reason)."""
+    """Return (list_of_paths, None, None) or (None, None, reason). Uses the file list the dashboard wrote,
+    so 1 or 2+ flag pages, legacy view etc. are picked up automatically and stale extra pages are never sent."""
     s = slug(target)
-    view, flags = Path(out_dir) / f"{s}_view.png", Path(out_dir) / f"{s}_flags.png"
-    if not view.exists() or not flags.exists():
-        return None, None, f"no pictures for '{target}' in {out_dir} (is the dashboard exporting?)"
     now = now or datetime.now(timezone.utc)
     man = load_manifest(out_dir)
     t = next((x for x in man.get("targets", []) if x.get("slug") == s), None)
     if not t:
-        return None, None, f"'{target}' not in manifest (no CMS data for it?)"
+        return None, None, f"'{target}' not in manifest (no CMS data for it, or the dashboard isn't exporting)"
+    names = t.get("files") or [f"{s}_view.png", f"{s}_flags.png"]
+    paths = [Path(out_dir) / n for n in names]
+    missing = [p.name for p in paths if not p.exists()]
+    if missing:
+        return None, None, f"missing picture(s): {', '.join(missing)}"
     try:
         exported = datetime.fromisoformat(t["exportedAt"].replace("Z", "+00:00"))
         cms = datetime.fromisoformat(t["cmsUpdated"].replace("Z", "+00:00"))
@@ -72,7 +75,7 @@ def pictures_for(out_dir: str, target: str, max_age_min: float, now: datetime | 
         return None, None, f"pictures are {age_exp:.0f} min old (dashboard closed?)"
     if age_cms > max_age_min:
         return None, None, f"CMS data is {age_cms:.0f} min old (export script stopped?)"
-    return str(view), str(flags), None
+    return [str(p) for p in paths], None, None
 
 
 # ----------------------------------------------------------------------------- Windows plumbing
@@ -265,7 +268,7 @@ class TeamsSender:
             return "Skipped (Windows only)"
         if not valid_chat_link(link):
             return "Error: chat link must contain /l/chat/ (Teams → chat → ⋯ → Copy link)"
-        view, flags, why = pictures_for(st["out_dir"], target, st["max_age_min"])
+        pics, _, why = pictures_for(st["out_dir"], target, st["max_age_min"])
         if why:
             return f"Skipped: {why}"
         # 1) wait for the user to be idle
@@ -299,7 +302,7 @@ class TeamsSender:
             press("ctrl", "a"); time.sleep(0.1)
             press("delete"); time.sleep(0.2)
             # 4) paste both pictures
-            for pth in (view, flags):
+            for pth in pics:
                 if fg_window() != teams_hwnd:
                     return "Error: focus left Teams before paste — aborted (nothing sent)"
                 set_clip_image(pth)
@@ -312,7 +315,7 @@ class TeamsSender:
             time.sleep(0.8)
             press("enter")
             time.sleep(0.6)
-            return f"Sent ✓ (view + flags) at {datetime.now().strftime('%I:%M:%S %p').lstrip('0')}"
+            return f"Sent ✓ ({len(pics)} pictures) at {datetime.now().strftime('%I:%M:%S %p').lstrip('0')}"
         finally:
             focus(prev)
             if prev_clip is not None:
