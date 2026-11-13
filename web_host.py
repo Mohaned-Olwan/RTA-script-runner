@@ -32,6 +32,9 @@ def web_dir() -> Path:
 
 
 # ----------------------------------------------------------------------------- local web server for the dashboard
+LAST_BYE = [0.0]      # time the dashboard page said goodbye (window closing or reloading)
+
+
 class _Handler(http.server.SimpleHTTPRequestHandler):
     extensions_map = {"": "application/octet-stream", ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8",
                       ".mjs": "text/javascript; charset=utf-8", ".css": "text/css", ".png": "image/png", ".svg": "image/svg+xml",
@@ -40,6 +43,13 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
+    def do_POST(self):
+        if self.path.startswith("/bye"):
+            LAST_BYE[0] = time.time()
+            self.send_response(204); self.end_headers()
+            return
+        self.send_response(404); self.end_headers()
+
     def end_headers(self):
         self.send_header("Cache-Control", "no-store")
         super().end_headers()
@@ -47,7 +57,9 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
 
 def start_server(root: Path) -> http.server.ThreadingHTTPServer:
     handler = lambda *a, **k: _Handler(*a, directory=str(root), **k)   # noqa: E731
-    srv = http.server.ThreadingHTTPServer(("127.0.0.1", PORT), handler)
+    class _Srv(http.server.ThreadingHTTPServer):
+        allow_reuse_address = not sys.platform.startswith("win")   # on Windows it would let two copies share the port
+    srv = _Srv(("127.0.0.1", PORT), handler)
     srv.daemon_threads = True
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     return srv
@@ -98,7 +110,7 @@ class Store:
 
 # ----------------------------------------------------------------------------- the host
 class WebHost:
-    def __init__(self, data_dir: Path, log=print, browser_exe: str | None = None):
+    def __init__(self, data_dir: Path, log=print, browser_exe: str | None = None, app_mode: bool = False):
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.profile = self.data_dir / "EdgeProfile"
@@ -121,6 +133,11 @@ class WebHost:
         self.server = None
         self.allow_front = False               # bring tabs to front when the engine asks (off: never steal focus)
         self.on_ready = []                     # callbacks (in host thread) after the dashboard is up
+        self.app_mode = app_mode               # the dashboard window is the app (Edge --app window)
+        self.app_handler = None                # callable(op, args) for "app.*" calls from the dashboard (runs in a worker thread)
+        self.dialog_handler = None             # callable(kind, message, default) → bool / text, for dialogs on the dashboard
+        self.on_user_close = None              # called when the user closed the app window
+        self._internal = False                 # we are closing pages ourselves
 
     # ---------- thread plumbing
     def start(self):
@@ -197,7 +214,12 @@ class WebHost:
             if self.want_open and self.ctx is None:
                 await self._launch()
             if self.ctx is not None and (self.dash is None or self.dash.is_closed()):
-                await self._open_dash(restart=True)
+                if self.app_mode:
+                    if not self._user_closed():     # the app window vanished without the user closing it → restart Edge
+                        self.log("RTA window lost — restarting it")
+                        await self._close_ctx()
+                else:
+                    await self._open_dash(restart=True)
             if time.time() - last_flush > 3:
                 last_flush = time.time()
                 try:
@@ -212,9 +234,14 @@ class WebHost:
     async def _launch(self):
         self.state, self.error = "starting", ""
         try:
+            args = ["--disable-blink-features=AutomationControlled", "--start-maximized", "--no-default-browser-check"]
+            if os.environ.get("RTA_DEBUG_PORT"):      # tests only
+                args.append(f"--remote-debugging-port={os.environ['RTA_DEBUG_PORT']}")
+            if self.app_mode:
+                args.append(f"--app={ORIGIN}/loading.html")
+            ignore = ["--enable-automation"] + (["about:blank"] if self.app_mode else [])   # start with ONLY the app window
             kw = dict(user_data_dir=str(self.profile), headless=False, no_viewport=True, accept_downloads=True,
-                      args=["--disable-blink-features=AutomationControlled", "--start-maximized", "--no-default-browser-check"],
-                      ignore_default_args=["--enable-automation"])
+                      args=args, ignore_default_args=ignore)
             if self.browser_exe:
                 kw["executable_path"] = self.browser_exe
             else:
@@ -244,10 +271,29 @@ class WebHost:
         self.ctx, self.dash = None, None
         self.pages.clear(); self.meta.clear(); self.ids.clear()
         self.state = "closed"
-        if self.want_open and not self.quit:
+        if self._internal or self.quit:
+            return
+        if self.app_mode and self._user_closed():
+            self.want_open = False
+            if self.on_user_close:
+                self.on_user_close()
+            return
+        if self.want_open:
             self.log("RTA browser was closed — reopening it (use 'Close browser' in the app to stop)")
 
+    def _user_closed(self):
+        return time.time() - LAST_BYE[0] < 10
+
+    def _on_dash_close(self, page):
+        if self._internal or self.quit or page is not self.dash:
+            return
+        if self.app_mode and self._user_closed():      # the user closed the RTA window → quit the app
+            self.want_open = False
+            if self.on_user_close:
+                self.on_user_close()
+
     async def _close_ctx(self):
+        self._internal = True
         ctx, self.ctx = self.ctx, None
         self.dash = None
         if ctx:
@@ -256,9 +302,12 @@ class WebHost:
             except Exception:
                 pass
         self.state = "closed"
+        self._internal = False
 
     async def _open_dash(self, reuse=None, restart=False):
         if restart:   # engine restarts with a fresh page → its old tabs are unknown to it: close them
+            if self.app_mode and self._user_closed():
+                return
             for tid, p in list(self.pages.items()):
                 try:
                     await p.close()
@@ -275,14 +324,34 @@ class WebHost:
 
         def on_dash_load(*_):   # the dashboard was reloaded (F5) → the engine restarts → drop its old tabs
             loads["n"] += 1
+            LAST_BYE[0] = 0.0
             if loads["n"] > 1:
                 asyncio.ensure_future(self._close_others())
         p.on("domcontentloaded", on_dash_load)
+        p.on("dialog", lambda d: asyncio.ensure_future(self._dialog(d)))
+        p.on("close", lambda pg: self._on_dash_close(pg))
         try:
             await p.goto(DASH_URL, wait_until="load", timeout=60000)
         except Exception as e:  # noqa: BLE001
             self.log(f"dashboard did not load: {e}")
         self.meta[tid]["status"] = "complete"
+
+    async def _dialog(self, d):
+        try:
+            if not self.dialog_handler:
+                await (d.accept() if d.type == "beforeunload" else d.dismiss())
+                return
+            loop = asyncio.get_running_loop()
+            res = await loop.run_in_executor(None, self.dialog_handler, d.type, d.message, d.default_value)
+            if d.type == "prompt":
+                await (d.accept(res) if res is not None else d.dismiss())
+            else:
+                await (d.accept() if res else d.dismiss())
+        except Exception:
+            try:
+                await d.dismiss()
+            except Exception:
+                pass
 
     async def _close_others(self):
         for tid, p in list(self.pages.items()):
@@ -433,6 +502,10 @@ class WebHost:
                             pass
                         break
             return {"id": 1, "state": "normal"}
+        if op.startswith("app."):
+            if not self.app_handler:
+                raise RuntimeError("not running inside the RTA app")
+            return await asyncio.get_running_loop().run_in_executor(None, self.app_handler, op, a)
         if op == "exec":
             p = self._page(a["tabId"])
             expr = f"({a['src']})(...{json.dumps(a.get('args') or [])})"

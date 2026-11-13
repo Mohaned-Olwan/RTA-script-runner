@@ -20,7 +20,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 APP_NAME = "RTA Script Runner"
-APP_VERSION = "2.1"
+APP_VERSION = "3.0"
 IS_WIN = sys.platform.startswith("win")
 
 
@@ -960,4 +960,8 @@ def run_app():
 
 
 if __name__ == "__main__":
-    run_app()
+    if "--classic" in sys.argv:
+        run_app()                 # the v2 window (fallback)
+    else:
+        import app_main
+        app_main.main()           # v3: the RTA dashboard window is the app

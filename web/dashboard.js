@@ -451,7 +451,7 @@ function compute(){
       const b=(S.lat.be||{})[f]; if(b) b.forEach((v,i)=>beArr[i]+=v); const q=(S.lat.prem||{})[f]; if(q) q.forEach((v,i)=>premArr[i]+=v); const z=(S.lat.act||{})[f]; if(z) z.forEach((v,i)=>actArr[i]+=v); }
     lobs[l.name] = {name:l.name, cfg:l, reqArr, beArr, premArr, actArr, hasReq, req:reqArr[idx]||0, be:beArr[idx]||0, prem:premArr[idx]||0, nextReq:reqArr[idx+1]||0, hasRt:!!S.cms[l.name],
       logged:0, prod:0, prodNoNest:0, states:{avail:0,acd:0,acw:0,other:0,auxout:0,prodaux:0,brk:0,coach:0,unprod:0},
-      schedOnQ:0, schedBreak:0, schedOOQ:0, schedLeave:0, inShift:0, nsRaw:0, schedArr:new Array(48).fill(0), flags:{}, agents:[]};
+      schedOnQ:0, schedBreak:0, schedOOQ:0, schedLeave:0, inShift:0, nsRaw:0, schedArr:new Array(48).fill(0), flags:{}, agents:[], schedActs:[]};
   }
   const agents = []; const seen = new Set();
   // ---- logged-in agents
@@ -519,6 +519,7 @@ function compute(){
   }
   // ---- schedule-based counts + missing
   const absentSet = new Set(getOff().absent.map(a=>String(a.hrid)));
+  const agByHr = new Map(agents.filter(a=>a.hrid).map(a=>[String(a.hrid),a]));
   for (const [hr, sch] of Object.entries(sched)){
     const ro = byHr.get(hr); if (!ro) continue;
     const L = lobs[tierToLob(ro.tier)]; if (!L) continue;
@@ -527,6 +528,12 @@ function compute(){
       for (let i=Math.max(0,Math.floor(a.s/30)); i<Math.min(48,Math.ceil(a.e/30)); i++){
         const ov = Math.min(a.e,(i+1)*30)-Math.max(a.s,i*30); if (ov>0) L.schedArr[i]+=ov/30; } }
     const act = actAt(sch,m); const cat = act?classifyAct(act.name):null;
+    if (act && (cat==='break' || cat==='coach')){   // Scheduled activities table (breaks + coachings happening now)
+      const lg = agByHr.get(String(hr));
+      L.schedActs.push({lob:L.name, hrid:hr, name:ro.name, sup:ro.sup, act:act.name, cat, s:act.s, e:act.e,
+        state: lg ? lg.state : 'NOT LOGGED IN', aux: lg ? lg.aux : '', sec: lg ? lg.sec : null, logged: !!lg,
+        onIt: !!lg && lg.state==='AUX' && (cat==='break' ? brA.has(norm(lg.aux)) : (coA.has(norm(lg.aux)) || trA.has(norm(lg.aux))))});
+    }
     const inShift = m>=sch.start && m<sch.end;
     if (!inShift) continue;
     if (cat==='leave'){ L.schedLeave++; continue; }
@@ -774,6 +781,18 @@ function flagGrid(Lx, only){
       </table></div>`; };
   return `<div class="flaggrid">${order.length?order.map(fbox).join(''):`<div class="fbox muted">${only?'No unproductive, unscheduled or system-issue agents right now.':'No flags right now.'}</div>`}</div>`;
 }
+function schedActsTable(Lx){
+  const Ls = Array.isArray(Lx) ? Lx : [Lx];
+  const rows = Ls.flatMap(L=>L.schedActs||[]).sort((a,b)=>a.cat.localeCompare(b.cat)||a.s-b.s||a.lob.localeCompare(b.lob)||String(a.name).localeCompare(String(b.name)));
+  const nB = rows.filter(r=>r.cat==='break').length, nC = rows.length-nB;
+  const stateCell = r => r.logged ? `<span class="${r.onIt?'':'warnTxt'}">${esc(r.state)}${r.aux?' · '+esc(r.aux):''}</span>` : '<span class="critTxt">Not logged in</span>';
+  return `<div class="flaggrid" style="margin-top:12px"><div class="fbox" style="grid-column:1/-1">
+    <div class="fh"><b>Scheduled activities</b><span class="muted" style="font-size:12px">${nB} break${nB===1?'':'s'} · ${nC} coaching / meeting</span><span class="st info">${rows.length}</span></div>
+    ${rows.length ? `<table><colgroup><col style="width:23%"><col style="width:11%"><col style="width:17%"><col style="width:11%"><col style="width:12%"><col style="width:18%"><col style="width:8%"></colgroup><tr><th>Agent</th><th>LOB</th><th>Supervisor</th><th>Activity</th><th>Scheduled</th><th>State now</th><th>Time</th></tr>
+    ${rows.map(r=>`<tr><td title="${esc(r.name)}">${esc(r.name)}</td><td>${esc(r.lob)}</td><td>${esc(r.sup)}</td><td>${esc(r.act)}</td><td class="num">${shortT(r.s)}–${shortT(r.e)}</td><td>${stateCell(r)}</td><td class="num">${r.logged?fmtDur(r.sec):'–'}</td></tr>`).join('')}
+    </table>` : `<div class="muted" style="padding:6px 2px">No breaks or coachings scheduled right now.</div>`}
+  </div></div>`;
+}
 function flagPages(Lx, only){
   const Ls = Array.isArray(Lx) ? Lx : [Lx];
   const groups = {};
@@ -933,7 +952,7 @@ function groupLegend(){
 function renderGroupView(name, el){
   const Ls = groupLobs(name);
   el.innerHTML = `${groupHead(name,'Realtime LA')}<div class="cgrid">${Ls.map(compactBlock).join('')}</div>${groupLegend()}
-    <h3 style="margin:18px 0 10px">Flags · all ${esc(name)} LOBs</h3>${flagGrid(Ls)}`;
+    <h3 style="margin:18px 0 10px">Flags · all ${esc(name)} LOBs</h3>${flagGrid(Ls)}${schedActsTable(Ls)}`;
 }
 function renderLobView(lobName, target){
   if (isGroup(lobName)) return renderGroupView(lobName, target || $('#view'));
@@ -941,7 +960,7 @@ function renderLobView(lobName, target){
   const el = target || $('#view');
   if (!L){ el.innerHTML='<div class="empty">Select a LOB</div>'; return; }
   el.innerHTML = `${viewHead(L,'Realtime LA')}
-  <div class="vgrid"><div class="vmain">${kpiBlock(L)}<div style="margin-top:14px">${flagGrid(L)}</div></div>${minSide(L)}</div>${viewFoot(L)}`;
+  <div class="vgrid"><div class="vmain">${kpiBlock(L)}<div style="margin-top:14px">${flagGrid(L)}${schedActsTable(L)}</div></div>${minSide(L)}</div>${viewFoot(L)}`;
   wireMinTbl(L, el);
 }
 function renderPic(kind, L, node, page=0){
@@ -1260,11 +1279,12 @@ function renderAll(){
   if (page==='page-overview') renderOverview();
   if (page==='page-lob' && !(document.activeElement && document.activeElement.closest && document.activeElement.closest('.mintbl'))){ renderLobSelect(); renderLobView(S.selLob); renderFlagPageBtns(); }
   if (page==='page-day'){ renderLobSelect(); renderDay(); }
-  if (page==='page-legacy'){ renderLobSelect(); $('#legSel').innerHTML=$('#lobSel').innerHTML; $('#legSel').value=S.selLob; if (S.result){ $('#legacyView').innerHTML = legacyHTML(S.selLob); $('#legacyFlags').innerHTML = `<h3 style="margin:4px 0 10px">Flags</h3>`+flagGrid(isGroup(S.selLob)?groupLobs(S.selLob):[S.result.lobs[S.selLob]].filter(Boolean)); } }
+  if (page==='page-legacy'){ renderLobSelect(); $('#legSel').innerHTML=$('#lobSel').innerHTML; $('#legSel').value=S.selLob; if (S.result){ $('#legacyView').innerHTML = legacyHTML(S.selLob); { const LsF = isGroup(S.selLob)?groupLobs(S.selLob):[S.result.lobs[S.selLob]].filter(Boolean); $('#legacyFlags').innerHTML = `<h3 style="margin:4px 0 10px">Flags</h3>`+flagGrid(LsF)+schedActsTable(LsF); } } }
   if (page==='page-agents') renderAgents();
   if (page==='page-setup') renderSetup();
   if (page==='page-auto' && window.renderAuto) renderAuto();
   if (page==='page-off' && !(document.activeElement && document.activeElement.closest && document.activeElement.closest('#page-off'))) renderOff();
+  if (window.onPageRender) window.onPageRender(page);
 }
 function switchTab(p){
   document.querySelectorAll('.tab').forEach(t=>t.classList.toggle('active',t.dataset.page===p));

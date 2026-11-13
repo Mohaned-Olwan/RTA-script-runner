@@ -199,6 +199,7 @@ h2{font-size:16px;margin:0} h3{font-size:13px;margin:0;color:var(--text-secondar
 .tooltip .tr{display:flex;justify-content:space-between;gap:12px}
 .flaggrid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
 .fbox{background:var(--surface-2);border-radius:12px;padding:10px 12px}
+.warnTxt{color:var(--warn);font-weight:600}.critTxt{color:var(--crit);font-weight:600}
 .fbox .fh{display:flex;align-items:center;justify-content:space-between;margin-bottom:6px}
 .fbox table{width:100%;border-collapse:collapse;font-size:12px;table-layout:fixed}
 .fbox th:nth-child(1){width:29%}.fbox th:nth-child(2){width:14%}.fbox th:nth-child(3){width:21%}.fbox th:nth-child(5){width:14%}
@@ -257,6 +258,9 @@ textarea.paste{width:100%;min-height:120px;background:var(--surface-2);border:1p
   <button class="tab" data-page="off">Scheduled off</button>
   <button class="tab" data-page="setup">Data &amp; Setup</button>
   <button class="tab" data-page="auto">⚙ Automation</button>
+  <button class="tab" data-page="scripts">🗂 Scripts</button>
+  <button class="tab" data-page="tdesk">💬 Teams desktop</button>
+  <button class="tab" data-page="reports">📑 Reports</button>
 </div>
 
 <!-- OVERVIEW -->
@@ -380,14 +384,18 @@ textarea.paste{width:100%;min-height:120px;background:var(--surface-2);border:1p
   </div>
 </section>
 <section class="page" id="page-auto"><div id="autoBody"><div class="card empty">Loading…</div></div></section>
+<section class="page" id="page-scripts"><div id="scriptsBody"><div class="card empty">Loading…</div></div></section>
+<section class="page" id="page-tdesk"><div id="tdeskBody"><div class="card empty">Loading…</div></div></section>
+<section class="page" id="page-reports"><div id="reportsBody"><div class="card empty">Loading…</div></div></section>
 <div class="toast" id="toast"></div>
 
 <script src="lib/xlsx.full.min.js"></script>
 <script src="lib/html2canvas.min.js"></script>
 <script src="dashboard.js"></script>
-<script>window.RTA_APP_VERSION = "2.0";</script>
+<script>window.RTA_APP_VERSION = "3.0";</script>
 <script src="host_shim.js"></script>
 <script src="ext_bridge.js"></script>
 <script type="module" src="background.js"></script>
+<script src="app_ui.js"></script>
 </body>
 </html>

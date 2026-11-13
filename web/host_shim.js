@@ -86,5 +86,7 @@
   window.IS_APP = true;
   // the automation engine treats a fresh page load like a browser start (old tab ids are gone)
   window.addEventListener('load', () => setTimeout(() => onStartup._L.forEach(f => { try { f(); } catch (e) { console.error(e); } }), 0));
-  window.rtaApp = { send: m => UI.runtime.sendMessage(m) };   // used by the app (Python) to drive the engine
+  window.rtaApp = { send: m => UI.runtime.sendMessage(m), call: (op, a) => host(op, a) };   // engine messages + app (Python) calls
+  // tell the app the window is closing (so closing the RTA window quits the app instead of reopening it)
+  window.addEventListener('pagehide', () => { try { navigator.sendBeacon('/bye', '1'); } catch (e) { } });
 })();

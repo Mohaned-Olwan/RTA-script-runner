@@ -1,5 +1,13 @@
 # RTA Script Runner
 
+## v3.0 — one app
+Opening `RTA_Script_Runner.exe` opens **one RTA window** (an Edge app window — no address bar, own taskbar icon): the dashboard tabs
+(Overview · LOB View · Legacy view · Day plan · Agents & Flags · Scheduled off · Data & Setup), **⚙ Automation** (CMS web + Teams web),
+and the app's own tabs **🗂 Scripts** (CMS scripts on a timer), **💬 Teams desktop** (backup sender) and **📑 Reports** (LAT / IEX + timers, roster).
+The CMS / Teams tabs the automation works in open in a second window that can sit behind the others (don't minimise it).
+Closing the RTA window quits the app; if anything is running it asks first. `RTA_Script_Runner.exe --classic` opens the old v2 window.
+New in the flags (LOB view + Legacy view): **Scheduled activities** — agents whose scheduled Break / Lunch / Coaching / Meeting is happening right now, with their current state.
+
 ## v2.1
 - **Teams desktop (backup)** now reads the Teams window through Windows UI Automation: finds the real "Type a message" box and confirms the cursor is in it (no Alt+Shift+C, **no Ctrl+A**), clears old drafts only inside the box, re-confirms before every paste, presses the real **Send** button (no Enter), then confirms the box emptied, no "failed to send", and a new picture appeared in the chat.
 - Desktop sending follows the interval rules: first send at :01 / :31, then every N min, nothing in the last 45 s, and pictures must be from the current interval (checked again right before Send). **Every** accepts `3` or `1/3/5` (minutes when failing / tight / passing).
