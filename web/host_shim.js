@@ -82,6 +82,10 @@
     },
     storage,
   };
+  // WebView2 (native app window): pywebview talks to Python through window.chrome.webview — keep it on the shim
+  const WV = window.chrome && window.chrome.webview;
+  if (WV) UI.webview = WV;
+  try { Object.defineProperty(UI, 'webview', { configurable: true, get: () => WV || (window.__rtaWV) }); } catch (e) { }
   try { Object.defineProperty(window, 'chrome', { configurable: true, writable: true, value: UI }); } catch (e) { window.chrome = UI; }
   window.IS_APP = true;
   // the automation engine treats a fresh page load like a browser start (old tab ids are gone)

@@ -3,6 +3,7 @@
 (() => {
   if (typeof window.rtaHost === 'function') return;
   window.__RTA_NATIVE = true;
+  try { window.__rtaWV = window.chrome && window.chrome.webview; } catch (e) { }
   let api = null;
   const ready = new Promise(res => {
     const ok = () => { if (window.pywebview && window.pywebview.api && window.pywebview.api.rpc) { api = window.pywebview.api; res(); return true; } return false; };
