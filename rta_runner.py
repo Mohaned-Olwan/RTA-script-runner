@@ -20,7 +20,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 APP_NAME = "RTA Script Runner"
-APP_VERSION = "2.0"
+APP_VERSION = "2.1"
 IS_WIN = sys.platform.startswith("win")
 
 
@@ -51,6 +51,7 @@ class Job:
     target: str = ""            # teams: dashboard LOB / group name
     link: str = ""              # teams: group-chat link
     hint: str = ""              # teams: optional text the Teams window title must contain
+    every_status: str = ""      # teams: "1/3/5" = minutes when failing / tight / passing ("" = fixed every_min)
 
 
 TEAMS_DEFAULTS = {"out_dir": r"C:\RTA\OUT", "idle_sec": 3, "max_age_min": 10, "max_wait_sec": 90}
@@ -149,6 +150,13 @@ class Runtime:
         self.proc: subprocess.Popen | None = None
         self.proc_started: float = 0.0
         self.active = False
+        # teams (interval-aligned)
+        self.pending = False
+        self.last_ok: dict | None = None
+        self.failed_at: float = 0.0
+        self.status: str | None = None
+        self.why = ""
+        self.last_eval: float = 0.0
 
 
 class Scheduler:
@@ -193,8 +201,8 @@ class Scheduler:
             if not valid_chat_link(j.link):
                 return "Paste the group chat link (Teams → chat → ⋯ → Copy link)"
             try:
-                if float(j.every_min) <= 0:
-                    return "'Every' must be more than 0 minutes"
+                from sched_util import parse_every
+                parse_every(j.every_status or j.every_min)
                 parse_hhmm(j.start_at); parse_hhmm(j.stop_at)
             except ValueError as e:
                 return str(e)
@@ -224,6 +232,12 @@ class Scheduler:
                 self.log(f"[{j.name or Path(j.path).name}] not started: {err}")
                 return err
             now = self.clock()
+            if j.kind == "teams":   # interval-aligned: first send at :01 / :31, then every N min, restart each interval
+                r.active, r.state, r.runs, r.stop_dt, r.failed_at, r.last_eval = True, "Waiting", 0, None, 0.0, 0.0
+                win = f" · {j.start_at or 'any time'}–{j.stop_at or 'no stop'}" if (j.start_at or j.stop_at) else ""
+                how = f"by status {j.every_status} min (failing/tight/passing)" if j.every_status else f"every {float(j.every_min):g} min"
+                self.log(f"[{self.label(j)}] started · {how}, from :01 / :31 of each interval{win}")
+                return None
             start_hm, stop_hm = parse_hhmm(j.start_at), parse_hhmm(j.stop_at)
             first = next_clock(start_hm, now) if start_hm else now
             if not start_hm and not j.run_now:
@@ -271,10 +285,23 @@ class Scheduler:
         if j.kind == "teams":
             if not self.sender:
                 r.last_result = "Error: sender not available"; return
-            def done(res, r=r):
+            from sched_util import est_parts
+            est = est_parts()
+
+            def done(res, r=r, est=est):
                 with self.lock:
                     r.last_result = res
-            r.last_result = self.sender.enqueue(j.id, j.target, j.link, j.hint, done)
+                    r.pending = False
+                    if res.startswith("Sent"):
+                        r.last_ok = {"at": time.time(), "idx": est["idx"], "est_date": est["est_date"]}
+                        r.failed_at = 0.0
+                    elif not manual:
+                        r.failed_at = time.time()      # skipped / error → try again in 1 min
+            r.pending = True
+            q = self.sender.enqueue(j.id, j.target, j.link, j.hint, done)
+            if q != "Queued":
+                r.pending = False
+            r.last_result = q
             r.last_run = self.clock(); r.runs += 1
             return
         if r.proc and r.proc.poll() is None:
@@ -317,6 +344,9 @@ class Scheduler:
                         r.state = "Waiting"
                 if not r.active:
                     continue
+                if j.kind == "teams":
+                    self._tick_teams(j, r, now)
+                    continue
                 if r.stop_dt and now >= r.stop_dt:
                     self.stop(jid, reason=f"Finished — stop time {r.stop_dt.strftime('%H:%M')} reached")
                     continue
@@ -332,6 +362,30 @@ class Scheduler:
                     if r.state not in ("Running",):
                         r.state = "Waiting"
 
+    def _tick_teams(self, j: Job, r: Runtime, now: datetime):
+        from sched_util import est_parts, status_of, every_for, is_due, next_due_ts, parse_every
+        t = time.time()
+        if r.pending or t - r.last_eval < 2:
+            return
+        r.last_eval = t
+        try:
+            every_min, by_status = parse_every(j.every_status or j.every_min)
+        except ValueError:
+            every_min, by_status = float(j.every_min or 3), None
+        if by_status and self.sender:
+            from teams_sender import target_value
+            r.status = status_of(target_value(self.sender.settings()["out_dir"], j.target), r.status)
+        every = every_for(every_min, by_status, r.status or "none")
+        est = est_parts()
+        if r.failed_at and t - r.failed_at < 60:
+            r.next_run = datetime.fromtimestamp(r.failed_at + 60)
+            return
+        due, r.why = is_due(est=est, local_min=now.hour * 60 + now.minute + now.second / 60, start=j.start_at, stop=j.stop_at,
+                            every=every, last=r.last_ok, now_ts=t)
+        r.next_run = datetime.fromtimestamp(next_due_ts(est=est, now_ts=t, every=every, last=r.last_ok)) if r.why != "outside start/stop" else None
+        if due:
+            self._fire(j, r)
+
     def _loop(self):
         while not self._stop.is_set():
             try:
@@ -342,7 +396,9 @@ class Scheduler:
 
     def snapshot(self):
         with self.lock:
-            return {jid: (r.state, r.next_run, r.last_run, r.last_result, r.runs, r.stop_dt, r.active)
+            st = {"crit": "Failing", "warn": "Tight", "good": "Passing"}
+            return {jid: (r.state, r.next_run, r.last_run, r.last_result, r.runs, r.stop_dt, r.active,
+                          st.get(r.status or "", "") if self.jobs.get(jid) and self.jobs[jid].every_status else "")
                     for jid, r in self.rt.items()}
 
 
@@ -424,7 +480,7 @@ def run_app():
     tab_s = tabs.add("CMS scripts")
     tab_t = tabs.add("Teams desktop (backup)")
     tab_r = tabs.add("Reports")
-    tabs.set("Live (web)")
+    tabs.set(os.environ.get("RTA_START_TAB") or "Live (web)")
 
     rows: dict[str, dict] = {}
 
@@ -441,10 +497,20 @@ def run_app():
             j.target = w["target"].get().strip()
             j.link = w["link"].get().strip()
             j.hint = w["hint"].get().strip()
-        try:
-            j.every_min = float(w["every"].get().strip() or 0)
-        except ValueError:
-            j.every_min = 0
+        ev = w["every"].get().strip()
+        if j.kind == "teams" and "/" in ev:
+            try:
+                from sched_util import parse_every
+                j.every_min, parts = parse_every(ev)
+                j.every_status = "/".join(f"{x:g}" for x in parts)
+            except ValueError:
+                j.every_status, j.every_min = ev, 0
+        else:
+            j.every_status = ""
+            try:
+                j.every_min = float(ev or 0)
+            except ValueError:
+                j.every_min = 0
         j.start_at = w["start"].get().strip()
         j.stop_at = w["stop"].get().strip()
         j.enabled = bool(w["en"].get())
@@ -478,7 +544,7 @@ def run_app():
         sched.set_jobs(jobs); persist()
 
     def common_tail(f, w, j, c):
-        w["every"] = ctk.CTkEntry(f, width=70, justify="center"); w["every"].insert(0, f"{j.every_min:g}"); w["every"].grid(row=0, column=c, padx=3); c += 1
+        w["every"] = ctk.CTkEntry(f, width=70, justify="center"); w["every"].insert(0, j.every_status or f"{j.every_min:g}"); w["every"].grid(row=0, column=c, padx=3); c += 1
         w["start"] = ctk.CTkEntry(f, width=70, justify="center", placeholder_text="now"); w["start"].insert(0, j.start_at); w["start"].grid(row=0, column=c, padx=3); c += 1
         w["stop"] = ctk.CTkEntry(f, width=70, justify="center", placeholder_text="never"); w["stop"].insert(0, j.stop_at); w["stop"].grid(row=0, column=c, padx=3); c += 1
         w["state"] = ctk.CTkLabel(f, text="Stopped", width=105, anchor="w", text_color=MUTED, font=ctk.CTkFont(weight="bold")); w["state"].grid(row=0, column=c, padx=3); c += 1
@@ -551,7 +617,7 @@ def run_app():
 
     tbar = ctk.CTkFrame(tab_t, fg_color="transparent"); tbar.pack(fill="x", pady=(0, 6))
     thead = ctk.CTkFrame(tab_t, fg_color="transparent"); thead.pack(fill="x", padx=6)
-    for i, (t, wd) in enumerate([("", 34), ("Dashboard LOB", 130), ("Group chat link", 200), ("Title contains", 110), ("Every", 70), ("Start", 70),
+    for i, (t, wd) in enumerate([("", 34), ("Dashboard LOB", 130), ("Group chat link", 200), ("Title contains", 110), ("Every · F/T/P", 70), ("Start", 70),
                                  ("Stop", 70), ("Status", 105), ("Next send", 100), ("Last send · result", 210), ("", 150)]):
         ctk.CTkLabel(thead, text=t, width=wd, anchor="w", text_color=MUTED, font=ctk.CTkFont(size=12)).grid(row=0, column=i, padx=3, sticky="w")
     tlist = ctk.CTkScrollableFrame(tab_t, fg_color=("gray95", "#1c2028"), corner_radius=12)
@@ -634,7 +700,7 @@ def run_app():
         ctk.set_appearance_mode(theme_var.get()); persist()
     ctk.CTkButton(sbar, text="◐", width=34, fg_color=("gray75", "#3a4150"), command=toggle_theme).pack(side="right")
     ctk.CTkCheckBox(sbar, text="Start all rows (both tabs) when the app opens", variable=autostart_var, command=persist).pack(side="right", padx=12)
-    ctk.CTkLabel(tbar, text="Sends view + flags pictures in one message. Keep Teams signed in. Test with 'Send' first.",
+    ctk.CTkLabel(tbar, text="Every: 3 = minutes · 1/3/5 = failing/tight/passing · sends from :01 / :31",
                  text_color=MUTED).pack(side="right", padx=8)
 
     # ---------- Reports tab (LAT + IEX exporters)
@@ -667,7 +733,17 @@ def run_app():
             entry.delete(0, "end"); entry.insert(0, os.path.normpath(d)); save_rset()
 
     def save_rset(*_):
-        teams_cfg["lat_dir"] = lat_dir.get().strip(); teams_cfg["iex_dir"] = iex_dir.get().strip(); persist()
+        teams_cfg["lat_dir"] = lat_dir.get().strip(); teams_cfg["iex_dir"] = iex_dir.get().strip()
+        try:
+            teams_cfg["rep_lat_on"], teams_cfg["rep_iex_on"], teams_cfg["rep_load_dash"] = bool(lat_rep.get()), bool(iex_rep.get()), bool(load_dash.get())
+            for k, e, dflt in (("rep_lat_every_h", lat_every, 1.0), ("rep_iex_every_h", iex_every, 2.0)):
+                try:
+                    teams_cfg[k] = max(0.25, float(e.get().strip()))
+                except ValueError:
+                    teams_cfg[k] = dflt
+        except NameError:      # timer widgets not built yet
+            pass
+        persist()
 
     def run_bg(btn, label, fn):
         def worker():
@@ -712,9 +788,21 @@ def run_app():
         except Exception as e:  # noqa: BLE001
             log(f"could not save LAT login: {e}")
         save_rset()
-        run_bg(lat_btn, "LAT export", lambda: RP.run_lat(kinds, d, lat_dir.get().strip(), u, pw_, log))
+        folder = lat_dir.get().strip()
+
+        def go():
+            paths = RP.run_lat(kinds, d, folder, u, pw_, log)
+            if d == RP.today_est() and live is not None:
+                live.last["lat"] = time.time(); live.load_files("lat", paths)
+        run_bg(lat_btn, "LAT export", go)
     lat_btn = ctk.CTkButton(lbf, text="Run LAT export", width=140, fg_color="#1f8a4c", hover_color="#187040", command=do_lat); lat_btn.pack(side="left")
     ctk.CTkButton(lbf, text="Open folder", width=110, fg_color=("gray75", "#3a4150"), command=lambda: open_folder(lat_dir.get())).pack(side="left", padx=8)
+    lat_rep = ctk.BooleanVar(value=bool(teams_cfg.get("rep_lat_on", False)))
+    ltf = ctk.CTkFrame(lat, fg_color="transparent"); ltf.grid(row=7, column=0, columnspan=8, sticky="w", padx=14, pady=(0, 12))
+    ctk.CTkCheckBox(ltf, text="Repeat every", variable=lat_rep, command=lambda: save_rset()).pack(side="left")
+    lat_every = ctk.CTkEntry(ltf, width=56, justify="center"); lat_every.insert(0, f"{float(teams_cfg.get('rep_lat_every_h', 1)):g}"); lat_every.pack(side="left", padx=6)
+    ctk.CTkLabel(ltf, text="hours (today's date, EST)", text_color=MUTED).pack(side="left")
+    lat_tlbl = ctk.CTkLabel(ltf, text="", text_color=MUTED); lat_tlbl.pack(side="left", padx=14)
 
     # IEX
     iu, ip = RP.cred_get("RTA Runner/IEX")
@@ -742,10 +830,25 @@ def run_app():
         except Exception as e:  # noqa: BLE001
             log(f"could not save IEX login: {e}")
         save_rset()
-        run_bg(iex_btn, "IEX export", lambda: RP.run_iex(a, b, iex_dir.get().strip(), u, pw_, log))
+        folder = iex_dir.get().strip()
+
+        def go():
+            path = RP.run_iex(a, b, folder, u, pw_, log)
+            if a == b == RP.today_est() and live is not None:
+                live.last["iex"] = time.time(); live.load_files("sched", [path])
+        run_bg(iex_btn, "IEX export", go)
     iex_btn = ctk.CTkButton(ibf, text="Run IEX export", width=140, fg_color="#1f8a4c", hover_color="#187040", command=do_iex); iex_btn.pack(side="left")
     ctk.CTkButton(ibf, text="Open folder", width=110, fg_color=("gray75", "#3a4150"), command=lambda: open_folder(iex_dir.get())).pack(side="left", padx=8)
-    for e in (lat_dir, iex_dir):
+    iex_rep = ctk.BooleanVar(value=bool(teams_cfg.get("rep_iex_on", False)))
+    itf = ctk.CTkFrame(iex, fg_color="transparent"); itf.grid(row=6, column=0, columnspan=8, sticky="w", padx=14, pady=(0, 12))
+    ctk.CTkCheckBox(itf, text="Repeat every", variable=iex_rep, command=lambda: save_rset()).pack(side="left")
+    iex_every = ctk.CTkEntry(itf, width=56, justify="center"); iex_every.insert(0, f"{float(teams_cfg.get('rep_iex_every_h', 2)):g}"); iex_every.pack(side="left", padx=6)
+    ctk.CTkLabel(itf, text="hours (today, EST · also runs when the RTA browser opens)", text_color=MUTED).pack(side="left")
+    iex_tlbl = ctk.CTkLabel(itf, text="", text_color=MUTED); iex_tlbl.pack(side="left", padx=14)
+    load_dash = ctk.BooleanVar(value=bool(teams_cfg.get("rep_load_dash", True)))
+    ctk.CTkCheckBox(tab_r, text="Load each new LAT / IEX file into the RTA dashboard (Live tab) when it's open — today's files only",
+                    variable=load_dash, command=lambda: save_rset()).pack(anchor="w", padx=12, pady=(6, 0))
+    for e in (lat_dir, iex_dir, lat_every, iex_every):
         e.bind("<FocusOut>", save_rset)
     ctk.CTkLabel(tab_r, text="Logins are saved in Windows Credential Manager (not in any file). Uses the Edge already installed on this PC.",
                  text_color=MUTED).pack(anchor="w", padx=12, pady=6)
@@ -754,15 +857,21 @@ def run_app():
     import web_tab as WT
     rp_snap = {"kinds": [], "lat_dir": "", "lat_user": "", "lat_pw": "", "iex_dir": "", "iex_user": "", "iex_pw": ""}
 
+    def fnum(e, d):
+        try:
+            return max(0.25, float(e.get().strip()))
+        except ValueError:
+            return d
+
     def snap_reports():   # UI thread: copy the Reports tab values for background jobs
         rp_snap.update(kinds=[k for k, v in (("Voice", lat_v), ("Chat", lat_c)) if v.get()], lat_dir=lat_dir.get().strip(),
                        lat_user=lat_user.get().strip(), lat_pw=lat_pw.get(), iex_dir=iex_dir.get().strip(),
-                       iex_user=iex_user.get().strip(), iex_pw=iex_pw.get())
+                       iex_user=iex_user.get().strip(), iex_pw=iex_pw.get(),
+                       lat_on=bool(lat_rep.get()), lat_every_h=fnum(lat_every, 1.0), iex_on=bool(iex_rep.get()), iex_every_h=fnum(iex_every, 2.0),
+                       load_dash=bool(load_dash.get()))
     snap_reports()
     live = WT.LiveTab(ctk, root, tab_w, teams_cfg, persist, log, RP, messagebox, filedialog,
-                      lat_params=lambda: (rp_snap["kinds"], rp_snap["lat_dir"], rp_snap["lat_user"], rp_snap["lat_pw"]),
-                      iex_params=lambda: (rp_snap["iex_dir"], rp_snap["iex_user"], rp_snap["iex_pw"]),
-                      colors=(GOOD, WARN, BAD, MUTED))
+                      rp=lambda: dict(rp_snap), colors=(GOOD, WARN, BAD, MUTED))
 
     # ---------- log
     logf = ctk.CTkFrame(root, fg_color="transparent"); logf.pack(fill="x", padx=16, pady=(0, 4))
@@ -801,8 +910,8 @@ def run_app():
         for jid, w in rows.items():
             if jid not in snap:
                 continue
-            state, nxt, last, res, runs, stop_dt, active = snap[jid]
-            label = state + (f" · {runs}" if runs and state in ("Running", "Waiting") else "")
+            state, nxt, last, res, runs, stop_dt, active, stat = snap[jid]
+            label = state + (f" · {runs}" if runs and state in ("Running", "Waiting") else "") + (f" · {stat}" if stat and active else "")
             w["state"].configure(text=label, text_color=STATE_COLOR.get(state, MUTED))
             w["next"].configure(text=fmt_dt(nxt) if active else "—")
             bad = res.startswith(("Error", "Exit"))
@@ -818,6 +927,7 @@ def run_app():
         clock_lbl.configure(text=datetime.now().strftime("%I:%M:%S %p").lstrip("0") + ("  · sending…" if sender.busy else ""))
         snap_reports()
         try:
+            lat_tlbl.configure(text=live.timer_text("lat")); iex_tlbl.configure(text=live.timer_text("iex"))
             live.refresh()
         except Exception as e:  # noqa: BLE001
             log(f"Live tab: {e}")

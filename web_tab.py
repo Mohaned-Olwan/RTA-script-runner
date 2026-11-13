@@ -56,18 +56,18 @@ def ago(t):
 
 
 class LiveTab:
-    def __init__(self, ctk, root, parent, cfg: dict, persist, log, RP, messagebox, filedialog, lat_params, iex_params, colors):
+    def __init__(self, ctk, root, parent, cfg: dict, persist, log, RP, messagebox, filedialog, rp, colors):
         self.ctk, self.root, self.cfg, self.persist, self.log, self.RP = ctk, root, cfg, persist, log, RP
         self.mb, self.fd = messagebox, filedialog
-        self.lat_params, self.iex_params = lat_params, iex_params      # callables → (kinds, folder, user, pw) / (folder, user, pw)
+        self.rp = rp      # callable → plain dict of the Reports tab values + its LAT/IEX timers (safe from any thread)
         self.GOOD, self.WARN, self.BAD, self.MUTED = colors
         self.host = WH.WebHost(local_dir(), log=lambda m: log("[RTA browser] " + m))
         self.host.on_ready.append(self._on_browser_ready)
         self.busy = {"lat": False, "iex": False, "roster": False}
-        self.last = {"lat": cfg.get("live_last_lat", 0), "iex": cfg.get("live_last_iex", 0), "roster": 0}
+        self.last = {"lat": cfg.get("rep_last_lat", 0), "iex": cfg.get("rep_last_iex", 0), "roster": 0}
         self.roster_sig = None
         self.roster_day = None
-        self.flags = {"lat": False, "iex": False, "roster": False, "roster_path": ""}   # plain copies for worker threads
+        self.flags = {"roster": False, "roster_path": ""}   # plain copies for worker threads
         self._build(parent)
         self._sync_flags()
         threading.Thread(target=self._auto_loop, name="rta-dayfiles", daemon=True).start()
@@ -124,26 +124,10 @@ class LiveTab:
         a.grid_columnconfigure(1, weight=1)
 
         # --- day files
-        d = self._card(sc, "Day files → dashboard (automatic)", "Pulls the files with the logins saved in the Reports tab and loads them into the dashboard. "
-                                                                 "LAT = Voice/Chat as ticked in the Reports tab, today (EST).")
-        self.lat_on = ctk.BooleanVar(value=bool(cfg.get("live_lat_on", False)))
-        ctk.CTkCheckBox(d, text="LAT: pull every", variable=self.lat_on, command=self._save).grid(row=2, column=0, sticky="w", padx=14, pady=4)
-        self.lat_every = ctk.CTkEntry(d, width=60, justify="center"); self.lat_every.insert(0, str(cfg.get("live_lat_every", 30)))
-        self.lat_every.grid(row=2, column=1, sticky="w"); self.lat_every.bind("<FocusOut>", self._save)
-        ctk.CTkLabel(d, text="min", text_color=self.MUTED).grid(row=2, column=2, sticky="w", padx=4)
-        self.lat_lbl = ctk.CTkLabel(d, text="", text_color=self.MUTED); self.lat_lbl.grid(row=2, column=3, sticky="w", padx=10)
-        self.lat_now = self._btn(d, "Pull now", lambda: self._start_job("lat"), None, 100); self.lat_now.grid(row=2, column=4, sticky="e", padx=14)
-
-        self.iex_on = ctk.BooleanVar(value=bool(cfg.get("live_iex_on", False)))
-        ctk.CTkCheckBox(d, text="IEX schedules: pull when the browser opens, then every", variable=self.iex_on, command=self._save).grid(row=3, column=0, sticky="w", padx=14, pady=4)
-        self.iex_every = ctk.CTkEntry(d, width=60, justify="center"); self.iex_every.insert(0, str(cfg.get("live_iex_every", 4)))
-        self.iex_every.grid(row=3, column=1, sticky="w"); self.iex_every.bind("<FocusOut>", self._save)
-        ctk.CTkLabel(d, text="h", text_color=self.MUTED).grid(row=3, column=2, sticky="w", padx=4)
-        self.iex_lbl = ctk.CTkLabel(d, text="", text_color=self.MUTED); self.iex_lbl.grid(row=3, column=3, sticky="w", padx=10)
-        self.iex_now = self._btn(d, "Pull now", lambda: self._start_job("iex"), None, 100); self.iex_now.grid(row=3, column=4, sticky="e", padx=14)
-
+        d = self._card(sc, "Day files → dashboard (automatic)", "LAT and IEX timers are in the Reports tab (tick \"load into the RTA dashboard\" there). "
+                                                                 "The roster is loaded from a file you keep updated.")
         self.ros_on = ctk.BooleanVar(value=bool(cfg.get("live_roster_on", False)))
-        ctk.CTkCheckBox(d, text="Roster file: load at start, each new day and when the file changes", variable=self.ros_on, command=self._save).grid(row=4, column=0, sticky="w", padx=14, pady=4)
+        ctk.CTkCheckBox(d, text="Roster file: load at start, each new day and when the file changes", variable=self.ros_on, command=self._save).grid(row=4, column=0, columnspan=3, sticky="w", padx=14, pady=4)
         rf = ctk.CTkFrame(d, fg_color="transparent"); rf.grid(row=5, column=0, columnspan=4, sticky="w", padx=40, pady=(0, 12))
         self.ros_path = ctk.CTkEntry(rf, width=420, placeholder_text=r"C:\...\Roster.xlsx"); self.ros_path.insert(0, cfg.get("live_roster", ""))
         self.ros_path.pack(side="left"); self.ros_path.bind("<FocusOut>", self._save)
@@ -161,20 +145,14 @@ class LiveTab:
 
     # ------------------------------------------------------------------ actions
     def _sync_flags(self):   # UI thread only
-        self.flags = {"lat": bool(self.lat_on.get()), "iex": bool(self.iex_on.get()), "roster": bool(self.ros_on.get()),
-                      "roster_path": self.ros_path.get().strip().strip('"')}
+        self.flags = {"roster": bool(self.ros_on.get()), "roster_path": self.ros_path.get().strip().strip('"')}
 
     def _save(self, *_):
         c = self.cfg
         c["live_autostart"] = bool(self.autostart.get())
-        c["live_lat_on"], c["live_iex_on"], c["live_roster_on"] = bool(self.lat_on.get()), bool(self.iex_on.get()), bool(self.ros_on.get())
-        for k, e, dflt in (("live_lat_every", self.lat_every, 30), ("live_iex_every", self.iex_every, 4)):
-            try:
-                c[k] = max(5 if k == "live_lat_every" else 1, float(e.get().strip()))
-            except ValueError:
-                c[k] = dflt
+        c["live_roster_on"] = bool(self.ros_on.get())
         c["live_roster"] = self.ros_path.get().strip().strip('"')
-        c["live_last_lat"], c["live_last_iex"] = self.last["lat"], self.last["iex"]
+        c["rep_last_lat"], c["rep_last_iex"] = self.last["lat"], self.last["iex"]
         self.persist()
 
     def _pick_roster(self):
@@ -223,13 +201,13 @@ class LiveTab:
     # ------------------------------------------------------------------ day files
     def _on_browser_ready(self):          # host thread — new browser session: IEX + roster right away
         self.roster_sig = None
-        if self.flags["iex"]:
+        if self.rp().get("iex_on"):
             self.last["iex"] = 0
 
     def _start_job(self, kind):
         if self.busy[kind]:
             return
-        if self.host.state != "open":
+        if kind == "roster" and self.host.state != "open":
             self.mb.showinfo("RTA Script Runner", "Open the RTA browser first."); return
         threading.Thread(target=self._job, args=(kind, True), daemon=True).start()
 
@@ -239,21 +217,19 @@ class LiveTab:
         self.busy[kind] = True
         try:
             if kind == "lat":
-                kinds, folder, user, pw = self.lat_params()
-                if not kinds or not user or not pw:
-                    raise RuntimeError("tick Voice/Chat and save the LAT login in the Reports tab first")
-                paths = self.RP.run_lat(kinds, self.RP.today_est(), folder, user, pw, self.log)
-                merged = merge_lat(paths, str(local_dir() / "LAT_for_dashboard.csv")) if len(paths) > 1 else paths[0]
-                self.host.load_day_files("lat", [merged])
-                self.log(f"[Day files] LAT loaded into the dashboard ({', '.join(kinds)})")
+                r = self.rp()
+                kinds = r["kinds"]
+                if not kinds or not r["lat_user"] or not r["lat_pw"]:
+                    raise RuntimeError("tick Voice/Chat and enter the LAT login in the Reports tab")
+                paths = self.RP.run_lat(kinds, self.RP.today_est(), r["lat_dir"], r["lat_user"], r["lat_pw"], self.log)
+                self.load_files("lat", paths)
             elif kind == "iex":
-                folder, user, pw = self.iex_params()
-                if not user or not pw:
-                    raise RuntimeError("save the IEX login in the Reports tab first")
+                r = self.rp()
+                if not r["iex_user"] or not r["iex_pw"]:
+                    raise RuntimeError("enter the IEX login in the Reports tab")
                 d = self.RP.today_est()
-                path = self.RP.run_iex(d, d, folder, user, pw, self.log)
-                self.host.load_day_files("sched", [path])
-                self.log("[Day files] IEX schedules loaded into the dashboard")
+                path = self.RP.run_iex(d, d, r["iex_dir"], r["iex_user"], r["iex_pw"], self.log)
+                self.load_files("sched", [path])
             else:
                 p = self.flags["roster_path"]
                 if not p or not os.path.exists(p):
@@ -269,29 +245,50 @@ class LiveTab:
         except Exception as e:  # noqa: BLE001
             self.log(f"[Day files] {kind.upper()} ✗ {e}")
             if kind != "roster":
-                self.last[kind] = time.time() - max(0, self._every(kind) - 600)   # retry in ~10 min
+                self.last[kind] = time.time() - max(0, self._every(kind) - 900)   # retry in ~15 min
         finally:
             self.busy[kind] = False
 
     def _every(self, kind):
         try:
-            return float(self.cfg.get("live_lat_every", 30)) * 60 if kind == "lat" else float(self.cfg.get("live_iex_every", 4)) * 3600
+            return max(0.25, float(self.rp().get(kind + "_every_h") or 1)) * 3600
         except Exception:
-            return 1800
+            return 3600
+
+    def load_files(self, kind, paths):
+        """Load exported files into the RTA dashboard if it's open and the Reports tab says so (any thread)."""
+        if not paths or not self.rp().get("load_dash") or self.host.state != "open":
+            return False
+        if kind == "lat" and len(paths) > 1:
+            paths = [merge_lat(paths, str(local_dir() / "LAT_for_dashboard.csv"))]
+        try:
+            self.host.load_day_files(kind, list(paths))
+            self.log(f"[Day files] {'LAT' if kind == 'lat' else 'IEX schedules' if kind == 'sched' else kind} loaded into the RTA dashboard")
+            return True
+        except Exception as e:  # noqa: BLE001
+            self.log(f"[Day files] couldn't load into the dashboard: {e}")
+            return False
+
+    def timer_text(self, kind):
+        if self.busy[kind]:
+            return "running…" + (" (IEX takes 2–5 min)" if kind == "iex" else "")
+        r = self.rp()
+        if not r.get(kind + "_on"):
+            return f"last: {ago(self.last[kind])}"
+        nxt = self.last[kind] + self._every(kind)
+        return f"last: {ago(self.last[kind])} · next: {'now' if nxt <= time.time() else datetime.fromtimestamp(nxt).strftime('%I:%M %p').lstrip('0')}"
 
     def _auto_loop(self):
         while True:
             time.sleep(15)
             try:
-                if self.host.state != "open":
-                    continue
                 now = time.time()
-                f = self.flags
-                if f["lat"] and not self.busy["lat"] and now - self.last["lat"] >= self._every("lat"):
+                r, f = self.rp(), self.flags
+                if r.get("lat_on") and not self.busy["lat"] and now - self.last["lat"] >= self._every("lat"):
                     threading.Thread(target=self._job, args=("lat",), daemon=True).start()
-                if f["iex"] and not self.busy["iex"] and now - self.last["iex"] >= self._every("iex"):
+                if r.get("iex_on") and not self.busy["iex"] and now - self.last["iex"] >= self._every("iex"):
                     threading.Thread(target=self._job, args=("iex",), daemon=True).start()
-                if f["roster"] and not self.busy["roster"]:
+                if f["roster"] and not self.busy["roster"] and self.host.state == "open":
                     p = f["roster_path"]
                     if p and os.path.exists(p):
                         st = os.stat(p)
@@ -326,8 +323,6 @@ class LiveTab:
                                 + (f" · last: {lr[:70]}" if lr else ""),
                                 text_color=self.WARN if paused else (self.BAD if lr.startswith("Error") else self.GOOD) if running.get("teams") else self.MUTED)
         self.pause_btn.configure(text="Resume" if paused else "Pause", fg_color="#e0a000" if paused else ("gray75", "#3a4150"))
-        self.lat_lbl.configure(text="pulling…" if self.busy["lat"] else f"last: {ago(self.last['lat'])}")
-        self.iex_lbl.configure(text="pulling… (2–5 min)" if self.busy["iex"] else f"last: {ago(self.last['iex'])}")
         self.ros_lbl.configure(text="loading…" if self.busy["roster"] else f"last: {ago(self.last['roster'])}")
         lines = st["log"]
         key = (len(lines), lines[-1]["t"] if lines else 0)

@@ -1,5 +1,10 @@
 # RTA Script Runner
 
+## v2.1
+- **Teams desktop (backup)** now reads the Teams window through Windows UI Automation: finds the real "Type a message" box and confirms the cursor is in it (no Alt+Shift+C, **no Ctrl+A**), clears old drafts only inside the box, re-confirms before every paste, presses the real **Send** button (no Enter), then confirms the box emptied, no "failed to send", and a new picture appeared in the chat.
+- Desktop sending follows the interval rules: first send at :01 / :31, then every N min, nothing in the last 45 s, and pictures must be from the current interval (checked again right before Send). **Every** accepts `3` or `1/3/5` (minutes when failing / tight / passing).
+- **Reports**: LAT and IEX each have **Repeat every N hours** (today's date, EST) and can load each new file straight into the RTA dashboard.
+
 ## v2.0 — Live (web) tab: everything in one app, no browser extension needed
 The app opens its own **RTA browser** (an Edge window with its own profile) that holds:
 - the **RTA dashboard** — same tabs as the HTML: Overview, LOB View, Legacy view, Day plan, Agents & Flags, Scheduled off, Data & Setup, **⚙ Automation**;
