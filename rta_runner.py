@@ -1,5 +1,6 @@
 """
-RTA Script Runner — runs CMS export scripts (.acsauto, .bat, .ps1, .vbs, .exe …) on a timer.
+RTA Script Runner — the RTA dashboard + live CMS web / Teams web automation (Live tab), CMS export scripts on a timer,
+the Teams desktop sender (backup) and the LAT / IEX report exporters.
 
 Each job: script file + every N minutes + optional start time + optional stop time.
 Jobs are saved to %APPDATA%\\RTA Runner\\jobs.json and a log is written next to it.
@@ -19,7 +20,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 APP_NAME = "RTA Script Runner"
-APP_VERSION = "1.3"
+APP_VERSION = "2.0"
 IS_WIN = sys.platform.startswith("win")
 
 
@@ -386,7 +387,7 @@ def run_app():
 
     root = ctk.CTk()
     root.title(f"{APP_NAME} {APP_VERSION}")
-    root.geometry("1380x780")
+    root.geometry("1380x860")
     root.minsize(1100, 600)
 
     autostart_var = ctk.BooleanVar(value=cfg["autostart"])
@@ -402,22 +403,28 @@ def run_app():
     head = ctk.CTkFrame(root, corner_radius=0, fg_color=("gray92", "#15181e"))
     head.pack(fill="x")
     ctk.CTkLabel(head, text="RTA Script Runner", font=ctk.CTkFont(size=18, weight="bold")).pack(side="left", padx=(18, 6), pady=12)
-    ctk.CTkLabel(head, text="CMS exports + Teams sending on a timer", text_color=MUTED).pack(side="left", pady=12)
+    ctk.CTkLabel(head, text="Dashboard · CMS web + Teams automation · scripts · reports", text_color=MUTED).pack(side="left", pady=12)
     clock_lbl = ctk.CTkLabel(head, text="", font=ctk.CTkFont(size=14, weight="bold"))
     clock_lbl.pack(side="right", padx=18)
     pause_btn = ctk.CTkButton(head, text="Pause Teams sending  (Ctrl+Alt+P)", width=230, fg_color=("gray75", "#3a4150"))
     pause_btn.pack(side="right", padx=8)
 
+    live = None
+
     def toggle_pause():
         sender.paused = not sender.paused
         log("Teams sending PAUSED" if sender.paused else "Teams sending resumed")
+        if live is not None:
+            live.set_paused(sender.paused)
     pause_btn.configure(command=toggle_pause)
 
     tabs = ctk.CTkTabview(root, corner_radius=12)
     tabs.pack(fill="both", expand=True, padx=12, pady=(6, 4))
+    tab_w = tabs.add("Live (web)")
     tab_s = tabs.add("CMS scripts")
-    tab_t = tabs.add("Teams sending")
+    tab_t = tabs.add("Teams desktop (backup)")
     tab_r = tabs.add("Reports")
+    tabs.set("Live (web)")
 
     rows: dict[str, dict] = {}
 
@@ -743,6 +750,20 @@ def run_app():
     ctk.CTkLabel(tab_r, text="Logins are saved in Windows Credential Manager (not in any file). Uses the Edge already installed on this PC.",
                  text_color=MUTED).pack(anchor="w", padx=12, pady=6)
 
+    # ---------- Live (web) tab: RTA browser + automation + automatic day files
+    import web_tab as WT
+    rp_snap = {"kinds": [], "lat_dir": "", "lat_user": "", "lat_pw": "", "iex_dir": "", "iex_user": "", "iex_pw": ""}
+
+    def snap_reports():   # UI thread: copy the Reports tab values for background jobs
+        rp_snap.update(kinds=[k for k, v in (("Voice", lat_v), ("Chat", lat_c)) if v.get()], lat_dir=lat_dir.get().strip(),
+                       lat_user=lat_user.get().strip(), lat_pw=lat_pw.get(), iex_dir=iex_dir.get().strip(),
+                       iex_user=iex_user.get().strip(), iex_pw=iex_pw.get())
+    snap_reports()
+    live = WT.LiveTab(ctk, root, tab_w, teams_cfg, persist, log, RP, messagebox, filedialog,
+                      lat_params=lambda: (rp_snap["kinds"], rp_snap["lat_dir"], rp_snap["lat_user"], rp_snap["lat_pw"]),
+                      iex_params=lambda: (rp_snap["iex_dir"], rp_snap["iex_user"], rp_snap["iex_pw"]),
+                      colors=(GOOD, WARN, BAD, MUTED))
+
     # ---------- log
     logf = ctk.CTkFrame(root, fg_color="transparent"); logf.pack(fill="x", padx=16, pady=(0, 4))
     ctk.CTkLabel(logf, text="Log", text_color=MUTED).pack(side="left")
@@ -795,21 +816,35 @@ def run_app():
         pause_btn.configure(text=("RESUME Teams sending" if sender.paused else "Pause Teams sending  (Ctrl+Alt+P)"),
                             fg_color=("#e0a000" if sender.paused else ("gray75", "#3a4150")))
         clock_lbl.configure(text=datetime.now().strftime("%I:%M:%S %p").lstrip("0") + ("  · sending…" if sender.busy else ""))
+        snap_reports()
+        try:
+            live.refresh()
+        except Exception as e:  # noqa: BLE001
+            log(f"Live tab: {e}")
         root.after(500, refresh)
 
     def on_close():
         active = [jid for jid, s_ in sched.snapshot().items() if s_[6]]
-        if active and not messagebox.askyesno(APP_NAME, f"{len(active)} row(s) are running. Closing stops them. Close anyway?"):
+        web_running = live.host.state == "open" and any((live.host.status()["cfg"].get("running") or {}).values())
+        if (active or web_running) and not messagebox.askyesno(APP_NAME, (f"{len(active)} row(s) are running. " if active else "")
+                                                             + ("CMS/Teams web automation is running in the RTA browser. " if web_running else "")
+                                                             + "Closing the app stops it (it resumes when you open the app again). Close anyway?"):
             return
         for jid in rows:
             apply_row(jid)
         save_tset(); persist()
-        sched.shutdown(); sender.shutdown(); root.destroy()
+        sched.shutdown(); sender.shutdown()
+        try:
+            live.shutdown()
+        except Exception:
+            pass
+        root.destroy()
 
     root.protocol("WM_DELETE_WINDOW", on_close)
     log(f"{APP_NAME} {APP_VERSION} ready · settings: {CONFIG_FILE}")
     if autostart_var.get():
         root.after(800, lambda: (start_kind("script"), start_kind("teams")))
+    live.start()
     refresh()
     root.mainloop()
 

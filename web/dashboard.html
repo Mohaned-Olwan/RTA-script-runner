@@ -1,0 +1,393 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head><link rel="icon" href="icons/i32.png">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RTA Realtime · Comcast EG</title>
+<style>
+:root{
+  --font:"Segoe UI Variable Text","Segoe UI",system-ui,-apple-system,Roboto,Arial,sans-serif;
+  --radius:12px;
+}
+:root[data-theme="dark"]{
+  color-scheme:dark;
+  --bg:#0d0f13; --surface-1:#15181e; --surface-2:#1c2028; --surface-3:#242935;
+  --border:#2a303c; --text-primary:#eef0f3; --text-secondary:#a7adb9; --text-muted:#737a88;
+  --accent:#3987e5; --accent-soft:rgba(57,135,229,.16);
+  --s1:#3987e5; --s2:#d95926; --s3:#199e70;
+  --good:#34c26f; --warn:#f0b429; --crit:#f0605d; --info:#9085e9;
+  --good-bg:rgba(52,194,111,.14); --warn-bg:rgba(240,180,41,.15); --crit-bg:rgba(230,103,103,.15); --info-bg:rgba(144,133,233,.14);
+  --grid:#262b35; --legacy-bg:#3b3f46; --bg-glass:rgba(13,15,19,.88); --good-line:#22724a; --s1b:#2a5b98; --s3b:#176b4f;
+}
+:root[data-theme="gray"]{
+  color-scheme:dark;
+  --bg:#33363b; --surface-1:#3d4147; --surface-2:#474c53; --surface-3:#535860;
+  --border:#5b6169; --text-primary:#f3f4f6; --text-secondary:#d0d3d8; --text-muted:#a7acb4;
+  --accent:#5aa0f0; --accent-soft:rgba(90,160,240,.18);
+  --s1:#5aa0f0; --s2:#f08a5d; --s3:#3fc495;
+  --good:#5fdc8f; --warn:#ffd04d; --crit:#ff7b78; --info:#b3a8ff;
+  --good-bg:rgba(95,220,143,.18); --warn-bg:rgba(255,208,77,.18); --crit-bg:rgba(255,123,120,.18); --info-bg:rgba(179,168,255,.18);
+  --grid:#5b6169; --bg-glass:rgba(51,54,59,.92); --legacy-bg:#4a4e55; --good-line:#3f8a5c; --s1b:#3b78c0; --s3b:#2a8f6b;
+}
+[data-theme="gray"] .tile[data-st="good"],[data-theme="gray"] .herola[data-st="good"]{background:#2f5a41;box-shadow:inset 3px 0 0 var(--good)}
+[data-theme="gray"] .tile[data-st="warn"],[data-theme="gray"] .herola[data-st="warn"]{background:#5e5228;box-shadow:inset 3px 0 0 var(--warn)}
+[data-theme="gray"] .tile[data-st="crit"],[data-theme="gray"] .herola[data-st="crit"]{background:#633436;box-shadow:inset 3px 0 0 var(--crit)}
+[data-theme="gray"] .lob[data-st="good"]{border-left:5px solid var(--good)} [data-theme="gray"] .lob[data-st="warn"]{border-left:5px solid var(--warn)} [data-theme="gray"] .lob[data-st="crit"]{border-left:5px solid var(--crit)}
+:root[data-theme="light"]{
+  color-scheme:light;
+  --bg:#e9e6de; --surface-1:#f3f0e9; --surface-2:#e8e4da; --surface-3:#dcd7cb;
+  --border:#d2ccbe; --legacy-bg:#dcdad5; --text-primary:#0b0b0b; --text-secondary:#52514e; --text-muted:#82817c;
+  --accent:#2a78d6; --accent-soft:rgba(42,120,214,.10);
+  --s1:#2a78d6; --s2:#eb6834; --s3:#1baf7a;
+  --good:#138a45; --warn:#b07a00; --crit:#d03b3b; --info:#6250d6;
+  --good-bg:rgba(19,138,69,.10); --warn-bg:rgba(237,161,0,.14); --crit-bg:rgba(208,59,59,.10); --info-bg:rgba(98,80,214,.10);
+  --grid:#d8d3c7; --bg-glass:rgba(233,230,222,.94); --good-line:#9fd8b6; --s1b:#86b6ef; --s3b:#8fd8bb;
+}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--text-primary);font-family:var(--font);font-size:14px}
+body{min-height:100vh}
+.num{font-variant-numeric:tabular-nums}
+.capture .num,.capture *{font-variant-numeric:normal!important;font-feature-settings:normal!important}
+button,select,input,textarea{font:inherit;color:inherit}
+button{cursor:pointer}
+/* ---------- top bar ---------- */
+.topbar{position:sticky;top:0;z-index:20;display:flex;align-items:center;gap:16px;padding:10px 20px;background:var(--bg-glass);backdrop-filter:blur(8px);border-bottom:1px solid var(--border)}
+.brand{display:flex;flex-direction:column;line-height:1.15}
+.brand b{font-size:15px;letter-spacing:.2px}
+.brand span{font-size:11px;color:var(--text-muted)}
+.clocks{display:flex;gap:6px;margin-left:8px}
+.clock{background:var(--surface-1);border:1px solid var(--border);border-radius:8px;padding:4px 10px;display:flex;flex-direction:column;line-height:1.1}
+.clock small{font-size:10px;color:var(--text-muted);text-transform:uppercase;letter-spacing:.6px}
+.clock b{font-size:14px}
+.clock.int{border-color:var(--accent);background:var(--accent-soft)}
+.spacer{flex:1}
+.pills{display:flex;gap:6px;flex-wrap:wrap}
+.pill{display:inline-flex;align-items:center;gap:6px;font-size:12px;padding:4px 10px;border-radius:999px;background:var(--surface-1);border:1px solid var(--border);color:var(--text-secondary);white-space:nowrap}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--text-muted)}
+.pill.ok .dot{background:var(--good)} .pill.bad .dot{background:var(--crit)} .pill.warn .dot{background:var(--warn)}
+.pill.live .dot{animation:pulse 1.6s infinite}
+@keyframes pulse{0%{box-shadow:0 0 0 0 var(--good-bg)}100%{box-shadow:0 0 0 8px transparent}}
+.btn{background:var(--surface-2);border:1px solid var(--border);border-radius:8px;padding:7px 12px;font-size:13px;display:inline-flex;align-items:center;gap:6px;white-space:nowrap}
+.btn:hover{background:var(--surface-3)}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+.btn.primary:hover{filter:brightness(1.08)}
+.btn.sm{padding:4px 9px;font-size:12px}
+.btn:disabled{opacity:.5;cursor:not-allowed}
+/* ---------- tabs ---------- */
+.tabs{display:flex;gap:4px;padding:12px 20px 0}
+.tab{padding:8px 14px;border-radius:8px 8px 0 0;border:1px solid transparent;border-bottom:none;color:var(--text-secondary);background:none}
+.tab.active{background:var(--surface-1);border-color:var(--border);color:var(--text-primary);font-weight:600}
+.page{display:none;padding:16px 20px 40px}
+.page.active{display:block}
+/* ---------- generic ---------- */
+.card{background:var(--surface-1);border:1px solid var(--border);border-radius:var(--radius)}
+.row{display:flex;gap:12px;flex-wrap:wrap;align-items:center}
+.muted{color:var(--text-muted)} .sec{color:var(--text-secondary)}
+h2{font-size:16px;margin:0} h3{font-size:13px;margin:0;color:var(--text-secondary);font-weight:600;text-transform:uppercase;letter-spacing:.6px}
+.empty{padding:60px 20px;text-align:center;color:var(--text-secondary)}
+.empty h2{margin-bottom:6px;color:var(--text-primary)}
+/* status chip */
+.st{display:inline-flex;align-items:center;gap:5px;font-size:12px;font-weight:600;padding:2px 8px;border-radius:999px;white-space:nowrap}
+.st.good{color:var(--good);background:var(--good-bg)} .st.warn{color:var(--warn);background:var(--warn-bg)}
+.st.crit{color:var(--crit);background:var(--crit-bg)} .st.info{color:var(--info);background:var(--info-bg)} .st.none{color:var(--text-muted);background:var(--surface-3)}
+/* ---------- overview ---------- */
+.kpis{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:12px;margin-bottom:16px}
+.kpi{padding:14px 16px}
+.kpi small{display:block;font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:.6px;margin-bottom:4px}
+.kpi b{font-size:26px;font-weight:650;letter-spacing:-.5px}
+.kpi .sub{font-size:12px;color:var(--text-secondary);margin-top:2px}
+.lobgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:12px}
+.lob{padding:14px 16px;cursor:pointer;transition:border-color .15s}
+.lob:hover{border-color:var(--accent)}
+.lob .hd{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px}
+.lob .hd b{font-size:15px}
+.lob .la{display:flex;align-items:baseline;gap:10px}
+.lob .la b{font-size:34px;font-weight:700;letter-spacing:-1px}
+.lob .stats{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-top:10px}
+.lob .stats div{background:var(--surface-2);border-radius:8px;padding:6px 8px}
+.lob .stats small{display:block;font-size:10px;color:var(--text-muted);text-transform:uppercase;letter-spacing:.4px}
+.lob .stats span{font-size:15px;font-weight:600}
+.lob .flagsline{display:flex;gap:6px;flex-wrap:wrap;margin-top:10px;min-height:22px}
+.lob.inactive{opacity:.55}
+/* ---------- LOB view (the picture) ---------- */
+.viewbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:12px}
+#view{width:1340px;max-width:100%;padding:22px 24px;background:var(--surface-1);border:1px solid var(--border);border-radius:16px}
+.vh{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;margin-bottom:16px}
+.vh .t{font-size:22px;font-weight:700;letter-spacing:-.3px}
+.vh .s{color:var(--text-secondary);margin-top:2px}
+.day-wrap{background:#fff;color:#000;padding:14px;border-radius:12px;display:inline-block;font-family:Calibri,'Segoe UI',sans-serif}
+.dpt{border-collapse:collapse;font-size:14px;color:#000}
+.dpt th{background:#000;color:#ffc000;padding:6px 10px;border:1px solid #444;white-space:nowrap}
+.dpt td{border:1px solid #c8c8c8;padding:3px 10px;text-align:center;white-space:nowrap;background:#fff2cc}
+.dpt td.iv{background:#203864;color:#fff;font-weight:600}
+.dpt td.pi{background:#dff0d8}
+.dpt tr.now td{outline:2px solid #2a78d6;outline-offset:-2px}
+.dpt tr.ov td{background:#1f4e79;color:#fff;font-weight:700}
+.dpt tr.ov td.hl{background:#00b050;color:#000}
+.dpt .tg{color:#006100;font-weight:700} .dpt .tw{color:#9c6500;font-weight:700} .dpt .tc{color:#c00000;font-weight:700}
+.dpt td.bg-g{background:#00b050!important;color:#000;font-weight:700} .dpt td.bg-w{background:#ffeb9c!important} .dpt td.bg-c{background:#ff7c80!important;font-weight:700}
+.dptitle{background:#1f1f2e;color:#fff;text-align:center;font-weight:700;font-size:18px;padding:8px}
+.legacy-wrap{background:var(--legacy-bg);color:var(--text-primary);padding:18px;border-radius:14px;display:inline-block;min-width:560px}
+.lghead{display:flex;flex-direction:column;gap:2px;margin-bottom:12px;font-family:Calibri,'Segoe UI',sans-serif}
+.lghead b{font-size:22px} .lghead span{color:var(--text-secondary);font-size:13px}
+.lggrid{display:grid;gap:18px}
+.lgblock{display:flex;flex-direction:column;gap:10px}
+.lgt{width:100%;border-collapse:collapse;box-shadow:0 1px 0 rgba(0,0,0,.08);font-family:Calibri,'Segoe UI',sans-serif;font-size:17px;color:#000}
+.lgt td,.lgt th{border:1px solid #9a9a9a;padding:6px 10px;text-align:center}
+.lgt th{font-size:26px;padding:12px;color:#000}
+.lgt td:first-child{width:62%;font-weight:600}
+.lg-g td{background:#e2efda}
+.lg-k td:first-child{background:#a6a6a6;font-weight:700}
+.lg-k td:last-child{background:#c6e0b4;font-weight:700}
+.lg-n td{background:#c6e0b4;font-weight:700}
+.lgt td.lg-good{background:#c6efce!important;color:#006100} .lgt td.lg-warn{background:#ffeb9c!important;color:#7a5a00} .lgt td.lg-crit{background:#ffc7ce!important;color:#9c0006}
+.lg-txt-good{color:#006100;font-weight:700} .lg-txt-crit{color:#9c0006;font-weight:700}
+.lgproj{background:var(--surface-2);border:1px solid var(--border);border-radius:12px;padding:10px 14px;color:var(--text-primary)}
+.lgproj small{display:block;font-size:11px;color:var(--text-muted);letter-spacing:.5px} .lgproj b{font-size:26px} .lgproj span{display:block;font-size:12px;color:var(--text-secondary)}
+.lgstates{background:var(--surface-2);border:1px solid var(--border);border-radius:12px;padding:10px 14px;color:var(--text-primary)}
+.lgstates small{font-size:11px;color:var(--text-muted);letter-spacing:.5px}
+.lgstates .legend{color:var(--text-secondary)}
+.legacy-pic{background:var(--legacy-bg)!important;color:var(--text-primary)!important}
+.legacy-pic .day-wrap{background:#fff}
+.pic .fbox table{font-size:14px} .pic .fbox th{font-size:12.5px} .pic .fbox td{padding:5px 6px}
+.cgrid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}
+.cblock{background:var(--surface-2);border-radius:14px;padding:14px}
+.cblock .herola{background:var(--surface-1)}
+.cblock .tile{background:var(--surface-1)}
+.vgrid{display:grid;grid-template-columns:minmax(0,1fr) 270px;gap:16px;align-items:start}
+.side{background:var(--surface-2);border-radius:14px;padding:12px}
+.side .sh{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
+.sidecol{display:flex;flex-direction:column;gap:12px}
+.lu{background:var(--surface-2);border-radius:14px;padding:10px 12px;border-left:4px solid var(--good)}
+.lu.warn{border-left-color:var(--warn)} .lu.bad{border-left-color:var(--crit)}
+.lu small{display:block;font-size:10.5px;color:var(--text-muted);text-transform:uppercase;letter-spacing:.5px}
+.lu b{font-size:20px;display:block} .lu span{font-size:11.5px;color:var(--text-secondary)}
+.mintbl tr.sel td{background:rgba(144,133,233,.22)!important}
+.mintbl tr.sel input{border-color:var(--info)}
+.offtbl{width:100%;border-collapse:collapse;font-size:12.5px}
+.offtbl th{text-align:left;color:var(--text-secondary);font-weight:600;padding:6px;border-bottom:1px solid var(--border)}
+.offtbl td{padding:5px 6px;border-bottom:1px solid var(--border)}
+.offtbl input{background:var(--surface-2);border:1px solid var(--border);border-radius:6px;padding:4px 6px;width:100%}
+.minsum{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:8px}
+.minsum div{background:var(--surface-1);border-radius:10px;padding:8px 10px}
+.minsum small{display:block;font-size:10px;color:var(--text-muted);text-transform:uppercase;letter-spacing:.5px}
+.minsum b{font-size:19px}
+.mintbl{width:100%;border-collapse:collapse;font-size:12px}
+.mintbl th{font-size:10.5px;color:var(--text-muted);font-weight:600;text-align:left;padding:3px 4px}
+.mintbl td{padding:1px 4px;border-top:1px solid var(--border);height:21px}
+.mintbl tr.now td{background:var(--accent-soft)}
+.mintbl tr.fut td{color:var(--text-muted)}
+.mintbl input{width:62px;background:transparent;border:1px solid transparent;border-radius:4px;padding:1px 4px;font-size:12px;text-align:right}
+.mintbl input:hover,.mintbl input:focus{border-color:var(--border);background:var(--surface-1);outline:none}
+.mintbl tr.man input{border-color:var(--info);color:var(--info)}
+.mintbl .lag{color:var(--good)} .mintbl .law{color:var(--warn)} .mintbl .lac{color:var(--crit)}
+.hero{display:grid;grid-template-columns:230px 1fr;gap:16px;margin-bottom:16px}
+.herola{background:var(--surface-2);border-radius:14px;padding:18px;display:flex;flex-direction:column;justify-content:center}
+.herola small{font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:.6px}
+.herola b{font-size:54px;font-weight:750;letter-spacing:-2px;line-height:1.05}
+.tiles{display:grid;grid-template-columns:repeat(5,1fr);gap:10px}
+.tile{background:var(--surface-2);border-radius:12px;padding:10px 12px}
+.tile small{display:block;font-size:10.5px;color:var(--text-muted);text-transform:uppercase;letter-spacing:.5px}
+.tile b{font-size:21px;font-weight:650}
+.tile .sub{font-size:11px;color:var(--text-secondary)}
+.statebar{display:flex;height:14px;border-radius:7px;overflow:hidden;gap:2px;margin:6px 0 8px;background:var(--surface-3)}
+.statebar div{height:100%}
+.legend{display:flex;gap:14px;flex-wrap:wrap;font-size:12px;color:var(--text-secondary)}
+.legend i{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:5px;vertical-align:-1px}
+.chartwrap{position:relative;background:var(--surface-2);border-radius:12px;padding:12px 14px;margin:14px 0}
+.tooltip{position:absolute;pointer-events:none;background:var(--surface-1);border:1px solid var(--border);border-radius:8px;padding:8px 10px;font-size:12px;box-shadow:0 6px 18px rgba(0,0,0,.25);display:none;z-index:5;min-width:150px}
+.tooltip .tr{display:flex;justify-content:space-between;gap:12px}
+.flaggrid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+.fbox{background:var(--surface-2);border-radius:12px;padding:10px 12px}
+.fbox .fh{display:flex;align-items:center;justify-content:space-between;margin-bottom:6px}
+.fbox table{width:100%;border-collapse:collapse;font-size:12px;table-layout:fixed}
+.fbox th:nth-child(1){width:29%}.fbox th:nth-child(2){width:14%}.fbox th:nth-child(3){width:21%}.fbox th:nth-child(5){width:14%}
+.fbox td,.fbox th{padding:4px 6px;text-align:left;border-top:1px solid var(--border);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.fbox th{color:var(--text-muted);font-weight:600;border-top:none;font-size:11px}
+.pic .fbox td{white-space:normal;overflow:visible;text-overflow:clip;word-break:break-word}
+.foot{display:flex;justify-content:space-between;color:var(--text-muted);font-size:11px;margin-top:14px}
+/* ---------- agents table ---------- */
+.filters{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:12px}
+.filters select,.filters input{background:var(--surface-1);border:1px solid var(--border);border-radius:8px;padding:6px 8px;font-size:13px}
+.tbl{width:100%;border-collapse:separate;border-spacing:0;font-size:12.5px}
+.tbl th{position:sticky;top:0;z-index:1;background:var(--surface-2);text-align:left;padding:8px;color:var(--text-secondary);font-weight:600;border-bottom:1px solid var(--border);cursor:pointer;white-space:nowrap;user-select:none}
+.tbl td{padding:6px 8px;border-bottom:1px solid var(--border);white-space:nowrap}
+.tbl tr:hover td{background:var(--surface-2)}
+.tbl td.flag{border-left:3px solid transparent}
+.tbl tr.sev3 td.flag{border-left-color:var(--crit)} .tbl tr.sev2 td.flag{border-left-color:var(--warn)} .tbl tr.sev1 td.flag{border-left-color:var(--info)}
+.tblwrap{background:var(--surface-1);border:1px solid var(--border);border-radius:var(--radius);overflow:auto;max-height:calc(100vh - 220px)}
+/* ---------- setup ---------- */
+.setup{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.setup .card{padding:16px}
+.drop{border:1.5px dashed var(--border);border-radius:12px;padding:14px;margin-top:10px;display:flex;align-items:center;gap:12px}
+.drop.ok{border-style:solid;border-color:var(--good-line)}
+.drop .info{flex:1;min-width:0}
+.drop .info b{display:block}
+.drop .info span{font-size:12px;color:var(--text-secondary)}
+.cfg label{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:6px 0;border-bottom:1px solid var(--border);font-size:13px}
+.cfg input[type=number],.cfg input[type=text],.cfg input[type=time],.cfg select{width:150px;background:var(--surface-2);border:1px solid var(--border);border-radius:6px;padding:4px 6px}
+.lobtbl{width:100%;border-collapse:collapse;font-size:12px}
+.lobtbl td,.lobtbl th{padding:4px;border-bottom:1px solid var(--border);text-align:left}
+.lobtbl input{width:100%;background:var(--surface-2);border:1px solid var(--border);border-radius:5px;padding:3px 5px;font-size:12px}
+textarea.paste{width:100%;min-height:120px;background:var(--surface-2);border:1px solid var(--border);border-radius:8px;padding:8px;font-family:Consolas,monospace;font-size:12px}
+.toast{position:fixed;bottom:20px;right:20px;background:var(--surface-3);border:1px solid var(--border);padding:10px 14px;border-radius:10px;box-shadow:0 8px 24px rgba(0,0,0,.3);display:none;z-index:50;max-width:420px}
+.hint{font-size:12px;color:var(--text-secondary);line-height:1.5}
+@media (max-width:1100px){.kpis{grid-template-columns:repeat(3,1fr)}.setup{grid-template-columns:1fr}.hero{grid-template-columns:1fr}.tiles{grid-template-columns:repeat(3,1fr)}.flaggrid{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<div class="topbar">
+  <div class="brand"><b>Realtime LA · Comcast EG</b><span>VXI Cairo · RTA dashboard</span></div>
+  <div class="clocks">
+    <div class="clock"><small>EST</small><b id="clkEst" class="num">--:--</b></div>
+    <div class="clock"><small>Cairo</small><b id="clkClt" class="num">--:--</b></div>
+    <div class="clock int"><small>Interval</small><b id="clkInt" class="num">--</b></div>
+  </div>
+  <div class="pills" id="pills"></div>
+  <div class="spacer"></div>
+  <button class="btn" id="btnRefresh" title="Re-read CMS folder now">⟳ Refresh</button>
+  <button class="btn" id="btnTheme" title="Toggle theme">◐</button>
+</div>
+<div class="tabs">
+  <button class="tab active" data-page="overview">Overview</button>
+  <button class="tab" data-page="lob">LOB View</button>
+  <button class="tab" data-page="legacy">Legacy view</button>
+  <button class="tab" data-page="day">Day plan</button>
+  <button class="tab" data-page="agents">Agents &amp; Flags</button>
+  <button class="tab" data-page="off">Scheduled off</button>
+  <button class="tab" data-page="setup">Data &amp; Setup</button>
+  <button class="tab" data-page="auto">⚙ Automation</button>
+</div>
+
+<!-- OVERVIEW -->
+<section class="page active" id="page-overview"><div id="ovBody"></div></section>
+
+<!-- LOB VIEW -->
+<section class="page" id="page-lob">
+  <div class="viewbar">
+    <select id="lobSel" class="btn"></select>
+    <button class="btn primary" id="btnCopyPng">⧉ Copy view picture</button>
+    <button class="btn primary" id="btnCopyFlags">⧉ Copy flags picture</button>
+    <span id="flagPageBtns"></span>
+    <button class="btn" id="btnSavePng">⤓ View PNG</button>
+    <button class="btn" id="btnSaveFlags">⤓ Flags PNG</button>
+    <button class="btn" id="btnAllPng">⤓ All LOBs (view)</button>
+    <span class="muted" id="viewNote"></span>
+  </div>
+  <div id="view"></div>
+</section>
+
+<!-- LEGACY -->
+<section class="page" id="page-legacy">
+  <div class="viewbar">
+    <select id="legSel" class="btn"></select>
+    <button class="btn primary" id="btnCopyLeg">⧉ Copy legacy picture</button>
+    <button class="btn" id="btnSaveLeg">⤓ Legacy PNG</button>
+  </div>
+  <div id="legacyView" class="legacy-wrap"></div>
+  <div id="legacyFlags" style="margin-top:16px;max-width:1340px"></div>
+</section>
+
+<!-- DAY PLAN -->
+<section class="page" id="page-day">
+  <div class="viewbar">
+    <select id="daySel" class="btn"></select>
+    <label class="pill">Planned ABS % <input type="number" id="dayAbs" step="0.1" min="0" max="100" style="width:64px" class="btn sm"></label>
+    <button class="btn primary" id="btnCopyDay">⧉ Copy day plan picture</button>
+    <button class="btn" id="btnSaveDay">⤓ Day plan PNG</button>
+    <span class="muted">Past intervals use the official LAT ACT Req; not published yet = treated as upcoming. Pass = LA ≥ <span id="dayPass"></span>%.</span>
+  </div>
+  <div id="dayView" class="day-wrap"></div>
+</section>
+
+<!-- AGENTS -->
+<section class="page" id="page-agents">
+  <div class="filters">
+    <input id="fSearch" placeholder="Search name / HRID / login…" style="width:220px">
+    <select id="fLob"></select><select id="fOm"></select><select id="fSup"></select>
+    <select id="fFlag"></select><select id="fState"></select><select id="fStatus"></select>
+    <label class="pill"><input type="checkbox" id="fFlagged"> Flagged only</label>
+    <span class="spacer"></span>
+    <span class="muted" id="fCount"></span>
+    <button class="btn sm" id="btnCsv">⤓ CSV</button>
+  </div>
+  <div class="tblwrap"><table class="tbl" id="agTbl"></table></div>
+</section>
+
+<!-- SCHEDULED OFF -->
+<section class="page" id="page-off">
+  <div class="setup">
+    <div class="card">
+      <div class="row" style="justify-content:space-between"><h2>Absent today</h2><span class="st none" id="absCount">0</span></div>
+      <p class="hint">Paste HRIDs (one column from Excel, or any text — every 9-digit HRID is picked up). These agents are never flagged as <b>Missing</b> today. They still count in scheduled numbers and sched LA.</p>
+      <textarea class="paste" id="absPaste" placeholder="100064343&#10;100064664&#10;…" style="min-height:90px"></textarea>
+      <div class="row" style="margin:8px 0 12px"><button class="btn sm primary" id="btnAbsAdd">Add to list</button><button class="btn sm" id="btnAbsClear">Clear list</button></div>
+      <div style="overflow:auto;max-height:60vh"><table class="offtbl" id="absTbl"></table></div>
+    </div>
+    <div class="card">
+      <div class="row" style="justify-content:space-between"><h2>NS% exclusions</h2><span class="st none" id="nsxCount">0</span></div>
+      <p class="hint">Pick a LOB and how many absent agents to take out of its <b>NS%</b> numerator (e.g. approved absences). Independent of the Absent-today list.</p>
+      <table class="offtbl" id="nsxTbl"></table>
+      <div class="row" style="margin:8px 0 22px"><button class="btn sm primary" id="btnNsxAdd">+ Add</button></div>
+      <div class="row" style="justify-content:space-between"><h2>Excused time windows</h2><span class="st none" id="winCount">0</span></div>
+      <p class="hint">HRID + start/end (Cairo time). During the window the agent gets <b>no flags</b> (missing, AUX, break…). Scheduled numbers are not changed.</p>
+      <div style="overflow:auto;max-height:65vh"><table class="offtbl" id="winTbl"></table></div>
+      <div class="row" style="margin-top:8px"><button class="btn sm primary" id="btnWinAdd">+ Add</button><button class="btn sm" id="btnWinClear">Clear all</button></div>
+    </div>
+  </div>
+</section>
+
+<!-- SETUP -->
+<section class="page" id="page-setup">
+  <div class="setup">
+    <div class="card">
+      <h2>1 · Start-of-day files</h2>
+      <p class="hint">Load once per day. Saved in this browser until tomorrow. CSV / XLSX / XLSB all work.</p>
+      <div class="drop" id="dropLat"><div class="info"><b>LAT export (REQ per interval)</b><span id="infoLat">Not loaded</span></div><label class="btn sm">Choose<input type="file" hidden accept=".csv,.xlsx,.xls,.xlsb,.txt" data-kind="lat"></label></div>
+      <div class="drop" id="dropRoster"><div class="info"><b>Roster (HRID, Avaya ID, Supervisor, OM, Tier)</b><span id="infoRoster">Not loaded</span></div><label class="btn sm">Choose<input type="file" hidden accept=".csv,.xlsx,.xls,.xlsb" data-kind="roster"></label></div>
+      <div class="drop" id="dropSched"><div class="info"><b>Agent schedules (NICE IEX export)</b><span id="infoSched">Not loaded</span></div><label class="btn sm">Choose<input type="file" hidden data-kind="sched"></label></div>
+      <p class="hint" style="margin-top:10px">Tip: drop all three at once anywhere on this card — files are auto-detected by their columns.</p>
+      <div class="row" style="margin-top:6px"><button class="btn sm" id="btnClearDay">Clear day files</button><button class="btn sm" id="btnClearSnaps">Reset intraday history</button></div>
+    </div>
+    <div class="card">
+      <h2>2 · Realtime CMS data</h2>
+      <p class="hint"><b>Recommended:</b> CMS Supervisor script exports each LOB to a folder (e.g. <code>C:\RTA\CMS\TSX.txt</code>) every minute. Connect that folder once — the dashboard re-reads it automatically.</p>
+      <div class="drop" id="dropOut"><div class="info"><b>Picture export folder (Teams sender reads it)</b><span id="infoOut">Not connected</span></div><button class="btn sm primary" id="btnOut">Connect</button></div>
+      <div class="drop" id="dropCms"><div class="info"><b>CMS export folder</b><span id="infoCms">Not connected</span></div><button class="btn sm primary" id="btnFolder">Connect folder</button></div>
+      <div class="row" style="margin-top:10px">
+        <label class="btn sm">Load CMS files manually<input type="file" hidden multiple accept=".txt,.csv,.xlsx,.xls" id="cmsFiles"></label>
+        <span class="hint">Auto-refresh every <input type="number" id="refreshSec" min="15" style="width:60px" class="btn sm"> s</span>
+      </div>
+      <h3 style="margin-top:16px">Or paste from CMS</h3>
+      <div class="row" style="margin:6px 0"><select id="pasteLob" class="btn sm"></select><button class="btn sm" id="btnPaste">Apply paste</button><button class="btn sm" id="btnPasteClear">Clear pasted</button></div>
+      <textarea class="paste" id="pasteBox" placeholder="Select all rows in the CMS real-time agent report → Ctrl+C → paste here"></textarea>
+    </div>
+    <div class="card">
+      <h2>Pictures per LOB</h2>
+      <p class="hint">Choose which pictures each LOB / group exports and sends to Teams. Saved automatically.</p>
+      <div style="overflow:auto"><table class="lobtbl" id="picTbl"></table></div>
+    </div>
+    <div class="card cfg" id="cfgCard">
+      <h2>Thresholds &amp; rules</h2>
+      <div id="cfgFields" style="margin-top:8px"></div>
+    </div>
+    <div class="card">
+      <h2>LOB setup</h2>
+      <p class="hint">Same mapping as the <i>ALL ROSTER</i> sheet. Separate multiple values with commas. <b>Prod AUX</b> = AUX reasons counted as productive for that LOB.</p>
+      <div style="overflow:auto"><table class="lobtbl" id="lobTbl"></table></div>
+      <div class="row" style="margin-top:8px"><button class="btn sm" id="btnAddLob">+ Add LOB</button><button class="btn sm" id="btnSaveLob">Save</button><button class="btn sm" id="btnResetCfg">Reset all settings to default</button></div>
+    </div>
+  </div>
+</section>
+<section class="page" id="page-auto"><div id="autoBody"><div class="card empty">Loading…</div></div></section>
+<div class="toast" id="toast"></div>
+
+<script src="lib/xlsx.full.min.js"></script>
+<script src="lib/html2canvas.min.js"></script>
+<script src="dashboard.js"></script>
+<script>window.RTA_APP_VERSION = "2.0";</script>
+<script src="host_shim.js"></script>
+<script src="ext_bridge.js"></script>
+<script type="module" src="background.js"></script>
+</body>
+</html>

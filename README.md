@@ -1,6 +1,22 @@
 # RTA Script Runner
 
-Two tabs: **CMS scripts** (run CMS export scripts on a timer) and **Teams sending** (post the dashboard pictures to Teams group chats).
+## v2.0 — Live (web) tab: everything in one app, no browser extension needed
+The app opens its own **RTA browser** (an Edge window with its own profile) that holds:
+- the **RTA dashboard** — same tabs as the HTML: Overview, LOB View, Legacy view, Day plan, Agents & Flags, Scheduled off, Data & Setup, **⚙ Automation**;
+- the **CMS web** report tabs (reads each report in memory via CMS web's "Export to Clipboard" — no files, no download prompts; logs back in by itself and reopens the reports in fresh tabs);
+- one **Teams web** tab per group chat (sends the pictures by pressing the Send button, waits 20 s after each send, reloads the chat link and retries on any error).
+
+Setup (once):
+1. **Live (web)** → **Open RTA browser** → sign in to Teams in that window (it stays signed in).
+2. In the dashboard → **⚙ Automation**: paste the CMS report links (`LOB: link`), save the CMS login, add the Teams chats.
+3. Back in the app: **Start** the CMS web collector and the Teams web sender.
+4. Optional: **Day files → dashboard** pulls LAT (every 30 min) and IEX schedules automatically with the logins saved in the Reports tab, and loads your roster file.
+
+Keep the RTA browser open — behind other windows is fine, don't minimise it. Closing it by accident: the app reopens it and the automation resumes.
+Web state + browser profile: `%LOCALAPPDATA%\RTA Runner\web`. The other tabs below work as before (CMS scripts, Teams desktop = backup, Reports).
+
+## Older tabs
+**CMS scripts** (run CMS export scripts on a timer) and **Teams desktop (backup)** (post the dashboard pictures to Teams group chats with the desktop app).
 
 Runs your CMS export scripts (`.acsauto`, also `.bat`, `.ps1`, `.vbs`, `.exe`) on a timer.
 

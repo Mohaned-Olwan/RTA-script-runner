@@ -1,0 +1,463 @@
+"""
+RTA Script Runner — live web automation host.
+
+Opens ONE Edge window with its own profile (driven by Playwright) that holds:
+  * the RTA dashboard (same tabs as the HTML/extension, incl. the ⚙ Automation tab) — served from 127.0.0.1
+  * the CMS web report tabs and the Teams web chat tabs the automation engine opens
+
+The automation engine is the same JavaScript as the Edge extension (background.js); this module provides the
+browser services it needs (tabs, running code in pages, storage) through window.rtaHost.
+Pages are kept "awake" (no background throttling) so sending works while the window is behind other windows.
+"""
+from __future__ import annotations
+
+import asyncio
+import fnmatch
+import http.server
+import json
+import os
+import sys
+import threading
+import time
+from pathlib import Path
+
+PORT = 47811
+ORIGIN = f"http://127.0.0.1:{PORT}"
+DASH_URL = ORIGIN + "/dashboard.html"
+
+
+def web_dir() -> Path:
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return Path(base) / "web"
+
+
+# ----------------------------------------------------------------------------- local web server for the dashboard
+class _Handler(http.server.SimpleHTTPRequestHandler):
+    extensions_map = {"": "application/octet-stream", ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8",
+                      ".mjs": "text/javascript; charset=utf-8", ".css": "text/css", ".png": "image/png", ".svg": "image/svg+xml",
+                      ".json": "application/json", ".txt": "text/plain; charset=utf-8", ".ico": "image/x-icon"}
+
+    def log_message(self, *a):
+        pass
+
+    def end_headers(self):
+        self.send_header("Cache-Control", "no-store")
+        super().end_headers()
+
+
+def start_server(root: Path) -> http.server.ThreadingHTTPServer:
+    handler = lambda *a, **k: _Handler(*a, directory=str(root), **k)   # noqa: E731
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", PORT), handler)
+    srv.daemon_threads = True
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
+
+
+# ----------------------------------------------------------------------------- storage (chrome.storage.local)
+class Store:
+    def __init__(self, path: Path):
+        self.path = path
+        self.lock = threading.Lock()
+        try:
+            self.data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            self.data = {}
+        self.dirty = False
+
+    def get(self, keys):
+        with self.lock:
+            if keys is None:
+                return dict(self.data)
+            if isinstance(keys, str):
+                keys = [keys]
+            if isinstance(keys, dict):
+                return {k: self.data.get(k, v) for k, v in keys.items()}
+            return {k: self.data[k] for k in keys if k in self.data}
+
+    def set(self, obj: dict):
+        with self.lock:
+            self.data.update(obj or {})
+            self.dirty = True
+
+    def remove(self, keys):
+        with self.lock:
+            for k in ([keys] if isinstance(keys, str) else keys or []):
+                self.data.pop(k, None)
+            self.dirty = True
+
+    def flush(self):
+        with self.lock:
+            if not self.dirty:
+                return
+            raw = json.dumps(self.data)
+            self.dirty = False
+        tmp = self.path.with_suffix(".tmp")
+        tmp.write_text(raw, encoding="utf-8")
+        tmp.replace(self.path)
+
+
+# ----------------------------------------------------------------------------- the host
+class WebHost:
+    def __init__(self, data_dir: Path, log=print, browser_exe: str | None = None):
+        self.data_dir = Path(data_dir)
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        self.profile = self.data_dir / "EdgeProfile"
+        self.store = Store(self.data_dir / "web_store.json")
+        self.log = log
+        self.browser_exe = browser_exe or os.environ.get("RTA_BROWSER_EXE")
+        self.loop: asyncio.AbstractEventLoop | None = None
+        self.thread: threading.Thread | None = None
+        self.pw = None
+        self.ctx = None
+        self.dash = None
+        self.pages: dict[int, object] = {}
+        self.meta: dict[int, dict] = {}
+        self.ids: dict[int, int] = {}          # id(page) -> tab id
+        self.next_id = 100
+        self.want_open = False
+        self.quit = False
+        self.state = "closed"                  # closed | starting | open | error
+        self.error = ""
+        self.server = None
+        self.allow_front = False               # bring tabs to front when the engine asks (off: never steal focus)
+        self.on_ready = []                     # callbacks (in host thread) after the dashboard is up
+
+    # ---------- thread plumbing
+    def start(self):
+        if self.thread and self.thread.is_alive():
+            return
+        self.thread = threading.Thread(target=self._run, name="rta-web", daemon=True)
+        self.thread.start()
+
+    def _run(self):
+        self.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.loop)
+        try:
+            self.loop.run_until_complete(self._main())
+        except Exception as e:  # noqa: BLE001
+            self.state, self.error = "error", str(e)
+            self.log(f"Web host stopped: {e}")
+
+    def call(self, coro, timeout=60):
+        """Run a coroutine in the host thread and wait for its result (from any thread)."""
+        if not self.loop:
+            raise RuntimeError("web host not started")
+        return asyncio.run_coroutine_threadsafe(coro, self.loop).result(timeout)
+
+    def submit(self, coro):
+        if self.loop:
+            return asyncio.run_coroutine_threadsafe(coro, self.loop)
+
+    # ---------- public API (thread-safe)
+    def open(self):
+        self.want_open = True
+        self.start()
+
+    def close(self):
+        self.want_open = False
+        if self.loop:
+            self.submit(self._close_ctx())
+
+    def shutdown(self):
+        self.want_open = False
+        self.quit = True
+        try:
+            self.store.flush()
+        except Exception:
+            pass
+        if self.loop:
+            try:
+                self.call(self._close_ctx(), timeout=15)
+            except Exception:
+                pass
+
+    def send(self, msg: dict, timeout=60):
+        """Message to the automation engine (same messages the Automation tab sends)."""
+        return self.call(self._send(msg), timeout=timeout)
+
+    def show_dashboard(self, page_id: str | None = None):
+        if self.loop:
+            self.submit(self._show_dash(page_id))
+
+    def load_day_files(self, kind: str, paths: list[str], timeout=120):
+        return self.call(self._load_files(kind, paths), timeout=timeout)
+
+    def status(self) -> dict:
+        d = self.store.get(["rta_cfg_auto", "rta_rt", "rta_log"])
+        return {"state": self.state, "error": self.error, "tabs": len(self.pages),
+                "cfg": d.get("rta_cfg_auto") or {}, "rt": d.get("rta_rt") or {}, "log": (d.get("rta_log") or [])[-40:]}
+
+    # ---------- main loop
+    async def _main(self):
+        from playwright.async_api import async_playwright
+        self.server = start_server(web_dir())
+        self.pw = await async_playwright().start()
+        last_flush = 0.0
+        while not self.quit:
+            if self.want_open and self.ctx is None:
+                await self._launch()
+            if self.ctx is not None and (self.dash is None or self.dash.is_closed()):
+                await self._open_dash(restart=True)
+            if time.time() - last_flush > 3:
+                last_flush = time.time()
+                try:
+                    self.store.flush()
+                except Exception as e:  # noqa: BLE001
+                    self.log(f"could not save web state: {e}")
+            await asyncio.sleep(1.5)
+        await self._close_ctx()
+        await self.pw.stop()
+        self.server.shutdown()
+
+    async def _launch(self):
+        self.state, self.error = "starting", ""
+        try:
+            kw = dict(user_data_dir=str(self.profile), headless=False, no_viewport=True, accept_downloads=True,
+                      args=["--disable-blink-features=AutomationControlled", "--start-maximized", "--no-default-browser-check"],
+                      ignore_default_args=["--enable-automation"])
+            if self.browser_exe:
+                kw["executable_path"] = self.browser_exe
+            else:
+                kw["channel"] = "msedge"
+            self.ctx = await self.pw.chromium.launch_persistent_context(**kw)
+        except Exception as e:  # noqa: BLE001
+            self.ctx = None
+            self.state, self.error = "error", str(e).splitlines()[0][:300]
+            self.log(f"RTA browser: could not open Edge — {self.error}")
+            await asyncio.sleep(10)
+            return
+        self.ctx.on("close", lambda *_: self._on_ctx_close())
+        self.ctx.on("page", self._register)
+        await self.ctx.add_init_script(path=str(web_dir() / "init.js"))
+        self.pages.clear(); self.meta.clear(); self.ids.clear()
+        first = self.ctx.pages[0] if self.ctx.pages else None
+        await self._open_dash(reuse=first)
+        self.state = "open"
+        self.log("RTA browser open — sign in to Teams there once (it stays signed in)")
+        for cb in list(self.on_ready):
+            try:
+                cb()
+            except Exception:
+                pass
+
+    def _on_ctx_close(self):
+        self.ctx, self.dash = None, None
+        self.pages.clear(); self.meta.clear(); self.ids.clear()
+        self.state = "closed"
+        if self.want_open and not self.quit:
+            self.log("RTA browser was closed — reopening it (use 'Close browser' in the app to stop)")
+
+    async def _close_ctx(self):
+        ctx, self.ctx = self.ctx, None
+        self.dash = None
+        if ctx:
+            try:
+                await ctx.close()
+            except Exception:
+                pass
+        self.state = "closed"
+
+    async def _open_dash(self, reuse=None, restart=False):
+        if restart:   # engine restarts with a fresh page → its old tabs are unknown to it: close them
+            for tid, p in list(self.pages.items()):
+                try:
+                    await p.close()
+                except Exception:
+                    pass
+            self.pages.clear(); self.meta.clear(); self.ids.clear()
+            self.log("Dashboard page reopened — automation restarted")
+        p = reuse if reuse and not reuse.is_closed() else await self.ctx.new_page()
+        await p.expose_function("rtaHost", self._rpc)
+        tid = self._register(p)
+        self.meta[tid]["pinned"] = True
+        self.dash = p
+        loads = {"n": 0}
+
+        def on_dash_load(*_):   # the dashboard was reloaded (F5) → the engine restarts → drop its old tabs
+            loads["n"] += 1
+            if loads["n"] > 1:
+                asyncio.ensure_future(self._close_others())
+        p.on("domcontentloaded", on_dash_load)
+        try:
+            await p.goto(DASH_URL, wait_until="load", timeout=60000)
+        except Exception as e:  # noqa: BLE001
+            self.log(f"dashboard did not load: {e}")
+        self.meta[tid]["status"] = "complete"
+
+    async def _close_others(self):
+        for tid, p in list(self.pages.items()):
+            if p is not self.dash:
+                try:
+                    await p.close()
+                except Exception:
+                    pass
+        self.log("Dashboard reloaded — automation restarted with fresh tabs")
+
+    # ---------- tabs
+    def _register(self, page):
+        key = id(page)
+        if key in self.ids:
+            return self.ids[key]
+        tid = self.next_id; self.next_id += 1
+        self.ids[key] = tid
+        self.pages[tid] = page
+        self.meta[tid] = {"status": "loading", "title": "", "nav": 0, "pinned": False}
+
+        def on_load(*_):
+            m = self.meta.get(tid)
+            if m is not None:
+                m["status"] = "complete"
+
+        def on_close(*_):
+            self.pages.pop(tid, None); self.meta.pop(tid, None); self.ids.pop(key, None)
+        page.on("load", on_load)
+        page.on("close", on_close)
+        return tid
+
+    def _page(self, tid):
+        p = self.pages.get(int(tid)) if tid is not None else None
+        if not p or p.is_closed():
+            raise RuntimeError(f"No tab with id: {tid}.")
+        return p
+
+    async def _tab(self, tid):
+        p = self._page(tid)
+        m = self.meta[int(tid)]
+        try:
+            m["title"] = await asyncio.wait_for(p.title(), 2)
+        except Exception:
+            pass
+        return {"id": int(tid), "windowId": 1, "status": m["status"], "url": p.url, "title": m.get("title", ""),
+                "active": p is self.dash, "discarded": False, "pinned": m.get("pinned", False), "index": 0}
+
+    async def _goto(self, tid, url):
+        p = self._page(tid)
+        m = self.meta[tid]
+        m["status"] = "loading"; m["nav"] += 1; n = m["nav"]
+        try:
+            await p.goto(url, wait_until="load", timeout=90000)
+        except Exception:
+            pass
+        if tid in self.meta and self.meta[tid]["nav"] == n:
+            self.meta[tid]["status"] = "complete"
+
+    async def _new_tab(self, url):
+        if self.ctx is None:
+            raise RuntimeError("No window with id: 1.")
+        p = await self.ctx.new_page()
+        tid = self._register(p)
+        if url and url != "about:blank":
+            self.meta[tid]["status"] = "loading"
+            asyncio.ensure_future(self._goto(tid, url))
+        else:
+            self.meta[tid]["status"] = "complete"
+        if self.dash and not self.dash.is_closed():   # keep the dashboard in front, not the new tab
+            try:
+                await self.dash.bring_to_front()
+            except Exception:
+                pass
+        return tid
+
+    # ---------- RPC from the page
+    async def _rpc(self, raw: str) -> str:
+        try:
+            m = json.loads(raw)
+            v = await self._op(m.get("op"), m.get("a"))
+            return json.dumps({"v": v})
+        except Exception as e:  # noqa: BLE001
+            return json.dumps({"err": str(e).splitlines()[0][:400] if str(e) else e.__class__.__name__})
+
+    async def _op(self, op, a):
+        if op == "storage.get":
+            return self.store.get(a)
+        if op == "storage.set":
+            self.store.set(a); return None
+        if op == "storage.remove":
+            self.store.remove(a); return None
+        if op == "tabs.create":
+            return await self._tab(await self._new_tab((a or {}).get("url")))
+        if op == "tabs.get":
+            return await self._tab(a)
+        if op == "tabs.update":
+            tid, props = a
+            self._page(tid)
+            if props.get("url"):
+                self.meta[int(tid)]["status"] = "loading"
+                asyncio.ensure_future(self._goto(int(tid), props["url"]))
+            if props.get("pinned") is not None:
+                self.meta[int(tid)]["pinned"] = bool(props["pinned"])
+            if props.get("active") and self.allow_front:
+                try:
+                    await self._page(tid).bring_to_front()
+                except Exception:
+                    pass
+            return await self._tab(tid)
+        if op == "tabs.remove":
+            for tid in (a if isinstance(a, list) else [a]):
+                p = self.pages.get(int(tid))
+                if p and p is not self.dash:
+                    try:
+                        await p.close()
+                    except Exception:
+                        pass
+            return None
+        if op == "tabs.query":
+            q = a or {}
+            out = []
+            for tid in list(self.pages):
+                try:
+                    t = await self._tab(tid)
+                except Exception:
+                    continue
+                if q.get("url") and not fnmatch.fnmatch(t["url"], q["url"]):
+                    continue
+                out.append(t)
+            return out
+        if op == "windows.create":
+            tid = await self._new_tab((a or {}).get("url"))
+            return {"id": 1, "state": "normal", "focused": False, "tabs": [await self._tab(tid)]}
+        if op == "windows.get":
+            if self.ctx is None:
+                raise RuntimeError("No window with id: 1.")
+            return {"id": 1, "state": "normal", "focused": False}
+        if op == "windows.getAll":
+            return [{"id": 1, "state": "normal"}] if self.ctx else []
+        if op == "windows.update":
+            wid, props = a
+            if props.get("focused"):   # "Show worker window": bring a CMS/Teams tab to the front
+                for tid, p in self.pages.items():
+                    if p is not self.dash and not p.is_closed():
+                        try:
+                            await p.bring_to_front()
+                        except Exception:
+                            pass
+                        break
+            return {"id": 1, "state": "normal"}
+        if op == "exec":
+            p = self._page(a["tabId"])
+            expr = f"({a['src']})(...{json.dumps(a.get('args') or [])})"
+            return await asyncio.wait_for(p.evaluate(expr), 60)
+        raise RuntimeError(f"unknown op {op}")
+
+    # ---------- app → dashboard
+    async def _send(self, msg):
+        if not self.dash or self.dash.is_closed():
+            raise RuntimeError("the RTA browser is not open")
+        return await self.dash.evaluate("m => window.rtaApp ? window.rtaApp.send(m) : null", msg)
+
+    async def _show_dash(self, page_id=None):
+        if not self.dash or self.dash.is_closed():
+            return
+        try:
+            await self.dash.bring_to_front()
+            if page_id:
+                await self.dash.evaluate("id => { const t = document.querySelector(`.tab[data-page=${id}]`); if (t) t.click(); }", page_id)
+        except Exception:
+            pass
+
+    async def _load_files(self, kind, paths):
+        if not self.dash or self.dash.is_closed():
+            raise RuntimeError("the RTA browser is not open")
+        await self.dash.set_input_files(f"input[type=file][data-kind={kind}]", paths)
+        await asyncio.sleep(2.5)
+        return True

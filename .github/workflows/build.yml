@@ -8,6 +8,6 @@ jobs:
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
       - run: pip install -r requirements.txt
-      - run: python -m PyInstaller --noconfirm --onefile --windowed --name RTA_Script_Runner --collect-all customtkinter --hidden-import teams_sender --hidden-import reports --hidden-import PIL.BmpImagePlugin --collect-all playwright rta_runner.py
+      - run: python -m PyInstaller --noconfirm --onefile --windowed --name RTA_Script_Runner --collect-all customtkinter --hidden-import teams_sender --hidden-import reports --hidden-import web_host --hidden-import web_tab --add-data "web;web" --hidden-import PIL.BmpImagePlugin --collect-all playwright rta_runner.py
       - uses: actions/upload-artifact@v4
         with: { name: RTA_Script_Runner, path: dist/RTA_Script_Runner.exe }
